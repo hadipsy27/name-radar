@@ -1,128 +1,201 @@
-# name-radar
+# Name Radar
 
-Small utility to check name usage on the web and basic domain information (WHOIS, DNS, crt.sh) using the script `check_name_with_whois_crt.js`.
+Cek pemakaian **nama brand/startup/PT/domain/username sosmed** secara cepat. Tool Node.js ini melakukan pencarian lintas mesin (SerpApi/Bing/DuckDuckGo), mem‑probe domain kandidat populer, dan memperkaya hasil dengan **WHOIS, DNS**, dan **crt.sh (Certificate Transparency)** — semuanya bisa berjalan **gratis** (tanpa API key), dengan opsi SerpApi jika tersedia.
 
-This repository includes a single Node.js script that can run in single-query mode or bulk mode (one name per line). It searches the web for results containing the name, extracts domains and page metadata, performs WHOIS/DNS checks and queries crt.sh for certificates, then outputs JSON to stdout and optional CSVs.
+---
 
-## Quick summary / contract
+## Fitur Utama
 
-- Input: a single name (positional) or an input file (`--input=names.txt`) with one name per line.
-- Output: JSON printed to stdout per name; optional CSV files per-name or a combined CSV.
-- Error modes: network timeouts, whois provider errors, crt.sh rate-limits — script prints errors per name but continues.
+* **Input tunggal atau bulk** (`--input=names.txt`).
+* **Multi‑engine search**: SerpApi (opsional), **Bing scraping**, **DuckDuckGo HTML**.
+* **Direct Domain Probe**: cek kandidat domain populer (mis. `name.com/.net/.io/.id/...`) meski hasil search kosong.
+* **Filter ketat** agar hanya hasil yang **benar‑benar memakai** nama:
 
-## Requirements
+  * `exact_domain`, `domain_contains`
+  * `social_exact`, `social_contains` (Instagram/TikTok/X/Twitter/YouTube/Linktree/Milkshake/GitHub/Behance/Medium)
+  * `org_title_exact`, `org_title_contains` (title mengandung PT/LLC/Ltd/Inc/Labs/Ventures, dll.)
+* **WHOIS + DNS + crt.sh** gratis (best‑effort; tidak menjamin ketersediaan untuk registrasi).
+* **CSV export** (per nama atau gabungan), **debug mode**, dan opsi **strict matching**.
 
-- Node.js 14+ (tested). The script uses CommonJS requires; use Node v14+ or v16+ for best compatibility.
-- npm (optional, for installing dependencies)
-- Internet access for WHOIS, DNS and crt.sh queries
+> ⚠️ **Disclaimer**: Hasil WHOIS/CRT/DNS bersifat indikatif. Untuk konfirmasi ketersediaan domain, gunakan registrar resmi (Namecheap/GoDaddy/WhoisXML API, dll.).
 
-## Install dependencies
+---
 
-1. Initialize a project (optional but recommended):
+## Instalasi
 
-```powershell
-# from repo root
+```bash
+# Buat folder projek dan inisialisasi
+mkdir name-radar && cd name-radar
 npm init -y
+
+# Install dependency (p-limit sudah kompatibel ESM/CommonJS di kode)
+npm i node-fetch@2 cheerio p-limit tldts dotenv csv-writer whois-json
 ```
 
-2. Install the runtime dependencies required by the script. Important: use `node-fetch@2` because the script uses CommonJS `require()`.
+Simpan file skrip sebagai **`check_name_with_whois_crt.js`** (isi file ada di repo/proyek Anda).
 
-```powershell
-npm install node-fetch@2 cheerio p-limit@3 tldts csv-writer whois-json dotenv
+> **Catatan `p-limit`**: Jika Anda menggunakan `p-limit@5` (ESM‑only), skrip ini sudah menambahkan shim `pLimit = pLimit.default || pLimit`, sehingga **tidak perlu downgrade**. Alternatif aman: `npm i p-limit@3`.
+
+---
+
+## Konfigurasi Opsional
+
+Buat file **`.env`** bila ingin memakai SerpApi untuk hasil yang lebih stabil:
+
 ```
-
-Notes:
-- `node-fetch@3` is ESM-only and will not work with `require('node-fetch')` used in the script. Pin to `node-fetch@2`.
-- `dotenv` is optional but useful to set `SERPAPI_KEY` in a `.env` file.
-
-## Environment variables
-
-- `SERPAPI_KEY` (optional): if set, the script will attempt to use SerpApi for searches (faster/more accurate). Create a `.env` file in the repo root:
-
-```text
 SERPAPI_KEY=your_serpapi_key_here
 ```
 
-The script loads environment variables with `dotenv` automatically.
+Tanpa SerpApi, tool akan otomatis pakai **Bing** dan fallback **DuckDuckGo**.
 
-## Usage (examples, PowerShell)
+---
 
-Open PowerShell at the repository root.
+## Cara Pakai (Singkat)
 
-# Single name (positional)
-```powershell
-node .\\check_name_with_whois_crt.js "MyStartupName"
+### Single Query
+
+```bash
+node check_name_with_whois_crt.js "LinkPulse" \
+  --engine=multi --probe=always --limit=30 --strict --debug
 ```
 
-# Single name with limit
-```powershell
-node .\\check_name_with_whois_crt.js "MyStartupName" --limit=30
+### Bulk Mode (file `.txt` satu nama per baris)
+
+```bash
+# Simpan file: names.txt
+# Contoh isi:
+# LinkPulse
+# IniDomain
+
+# CSV gabungan semua nama
+node check_name_with_whois_crt.js --input=names.txt \
+  --engine=multi --probe=auto --limit=25 --strict \
+  --combine-csv=all_results.csv
+
+# Atau CSV per nama
+node check_name_with_whois_crt.js --input=names.txt \
+  --engine=multi --probe=auto --limit=25 --strict \
+  --outdir=out_csv
 ```
 
-# Single name, save per-run CSV
-```powershell
-node .\\check_name_with_whois_crt.js "MyStartupName" --out=results.csv
+---
+
+## Opsi/Flags
+
+* `--engine=auto|serpapi|bing|ddg|multi`
+
+  * `auto`: SerpApi jika ada key → kalau tidak ada, Bing → DDG.
+  * `multi`: coba berurutan SerpApi (jika ada), lalu Bing, lalu DDG.
+* `--probe=auto|always|off`
+
+  * `auto/always`: cek kandidat domain populer (`.com .net .org .io .co .id .co.id .ai .app .dev`).
+* `--limit=<N>`: jumlah URL target dari mesin pencari (default 30).
+* `--strict`: hanya hasil **exact** (`exact_domain`, `social_exact`, `org_title_exact`).
+* `--allow-mentions`: izinkan hasil yang **hanya menyebut** nama di body (default: dibuang).
+* `--no-whois`, `--no-crt`: matikan enrichment WHOIS / crt.sh.
+* `--debug`: cetak URL hasil per engine & ringkasan match untuk audit.
+* Output:
+
+  * Single: `--out=hasil.csv`.
+  * Bulk: `--combine-csv=all.csv` (gabungan) atau `--outdir=out_csv` (per nama).
+
+---
+
+## Skema Output CSV
+
+Kolom yang dihasilkan:
+
+| Kolom                   | Deskripsi                                                                                                                     |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `query_name`            | Nama yang dicari                                                                                                              |
+| `domain`                | Domain (registrable) yang terkait                                                                                             |
+| `tld`                   | TLD/public suffix                                                                                                             |
+| `hostname`              | Hostname dari URL                                                                                                             |
+| `url`                   | Sumber URL                                                                                                                    |
+| `title`                 | `<title>` halaman                                                                                                             |
+| `snippet`               | Deskripsi singkat (meta description/paragraf awal)                                                                            |
+| `resolves`              | `yes/no` hasil cek DNS A/AAAA                                                                                                 |
+| `whois_available_guess` | Heuristik ketersediaan (`likely`/`taken_or_unknown`/`err:...`)                                                                |
+| `crt_count`             | Jumlah entri sertifikat dari crt.sh (indikasi pemakaian/subdomain)                                                            |
+| `match_type`            | Tipe kecocokan: `exact_domain`, `domain_contains`, `social_exact`, `social_contains`, `org_title_exact`, `org_title_contains` |
+| `match_score`           | Skor prioritas (0–100)                                                                                                        |
+| `social_platform`       | Platform sosial (jika cocok)                                                                                                  |
+| `social_username`       | Username/handle yang cocok                                                                                                    |
+
+> **Interpretasi cepat**:
+>
+> * `exact_domain` + `resolves=yes` → sangat mungkin **sudah dipakai**.
+> * `whois_available_guess=likely` → domain *mungkin* available (perlu konfirmasi ke registrar).
+> * `crt_count>0` → ada jejak sertifikat SSL (indikasi aktif/pemakaian sebelumnya).
+
+---
+
+## Prinsip Matching
+
+* **Domain**: cocok jika SLD (second-level domain, tanpa TLD) **sama** atau **mengandung** nama.
+* **Sosmed**: cocok jika handle/username sama atau mengandung nama. Platform yang didukung: Instagram, TikTok, X/Twitter, YouTube, Linktree, Milkshake, GitHub, Behance, Medium.
+* **Organisasi (title)**: `<title>` mengandung frasa organisasi (PT/CV/Inc/Ltd/LLC/Company/Perusahaan/Studio/Ventures/Labs) dan stringnya cocok.
+* **Mentions**: hasil yang hanya “menyebut” di body dibuang secara default (aktifkan `--allow-mentions` bila perlu).
+
+---
+
+## Contoh Penggunaan
+
+### 1) Cek satu nama dengan filter ketat
+
+```bash
+node check_name_with_whois_crt.js "IniDomain" --strict --engine=multi --probe=always --limit=30 --out=IniDomain.csv
 ```
 
-# Bulk mode: provide input file (one name per line). Save per-name CSVs into a directory:
-```powershell
-node .\\check_name_with_whois_crt.js --input=names.txt --outdir=out_csv --limit=25
+### 2) Audit hasil mesin pencari (debug)
+
+```bash
+node check_name_with_whois_crt.js "LinkPulse" --engine=multi --probe=auto --limit=30 --debug
 ```
 
-# Bulk mode: combine into a single CSV
-```powershell
-node .\\check_name_with_whois_crt.js --input=names.txt --combine-csv=all_results.csv --limit=25
+### 3) Bulk + CSV gabungan
+
+```bash
+node check_name_with_whois_crt.js --input=names.txt \
+  --engine=multi --probe=auto --limit=25 \
+  --combine-csv=all_results.csv
 ```
 
-# Additional flags
-- `--limit=N` — maximum number of search results to process per name (default ~30)
-- `--mode=auto|serpapi|scrape` — search provider selection (auto uses SerpApi if key present)
-- `--no-whois` — skip WHOIS checks
-- `--no-crt` — skip crt.sh queries
+---
 
-Example with options:
+## Tips Akurasi & Performa
 
-```powershell
-node .\\check_name_with_whois_crt.js "MyStartupName" --limit=40 --mode=auto --out=single.csv --no-whois
-```
+* **SerpApi** (jika ada): hasil paling stabil, kurangi false negative.
+* **`--probe=always`**: memastikan domain obvious (mis. `name.com/.net/.io`) tetap terdeteksi walau mesin cari kosong.
+* **Rate limit**: crt.sh & WHOIS bisa menolak jika terlalu sering — gunakan **`--limit` lebih kecil** atau jalankan batch.
+* **Caching/Retry**: untuk produksi, tambahkan cache sederhana (file/Redis) dan retry backoff.
 
-## Input file format (for `--input`)
-
-- Plain text file, one name per line. Empty lines and lines starting with `#` are ignored.
-
-Example `names.txt`:
-
-```text
-# names to check
-MyStartup
-AnotherProject
-cool-name-2025
-```
-
-## Output
-
-- JSON summary for each name is printed to stdout. The script prints a short JSON meta object per name. Full per-URL results are used to create CSV rows when requested.
-- CSV columns (when created): `query_name, domain, tld, hostname, url, title, snippet, resolves, whois_available_guess, crt_count`.
+---
 
 ## Troubleshooting
 
-- WHOIS failures: public whois lookups can be rate-limited by registrars. If you get many errors, run with `--no-whois` or use a paid WHOIS API and adapt the script.
-- crt.sh errors / empty responses: crt.sh may rate-limit or return non-JSON pages. Script handles common cases but may return fewer entries.
-- `node-fetch` ESM error: if you see an error about `require()` or ESM, ensure you installed `node-fetch@2`.
-- DNS resolution: script uses Node's `dns` module; local DNS settings or firewalls may affect results.
+* **`pLimit is not a function`**: gunakan versi p-limit v3 (`npm i p-limit@3`) **atau** pakai skrip ini (sudah ada shim `pLimit = pLimit.default || pLimit`).
+* **Tidak ada hasil padahal manual ada**: jalankan dengan `--engine=multi --probe=always --debug`. Cek log `[DEBUG]` apakah URL target terparsing. Mesin pencari kadang A/B test layout; fallback DDG dan probe domain akan membantu.
+* **WHOIS `taken_or_unknown`**: artinya tidak ada frasa “not found” yang jelas; lakukan konfirmasi ke registrar.
 
-## Optional improvements
+---
 
-- Add a `package.json` scripts entry:
+## Keamanan & Etika
 
-```json
-"scripts": {
-	"start": "node check_name_with_whois_crt.js"
-}
-```
+* Patuhi robots.txt/ToS situs yang diakses. Gunakan alat ini secara wajar, hindari beban berlebihan.
+* Jangan gunakan untuk scraping agresif atau tujuan yang melanggar hukum/kebijakan layanan.
 
-- Add unit tests for parsing helpers and a small integration test with a short input file.
+---
 
-## License
+## Roadmap (Opsional)
 
-See the `LICENSE` file in this repository.
+* Integrasi **registrar API** (Namecheap/GoDaddy/WhoisXML) untuk availability yang presisi.
+* **Whitelist/Blacklist platform** via flag `--include=ig,tiktok --exclude=facebook`.
+* **Output JSON file** per query/bulk.
+* **Dockerfile** dan GitHub Action untuk run terjadwal.
+
+---
+
+## Lisensi
+
+Apache License —

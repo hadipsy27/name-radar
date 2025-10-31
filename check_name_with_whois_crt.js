@@ -1,27 +1,27 @@
 /**
- * check_name_with_whois_crt.js (focused match: domain / social username / org title)
+ * check_name_with_whois_crt.js — All-in-One
  *
- * Run examples:
- *   # single
- *   node check_name_with_whois_crt.js "ayocekdisini" --limit=30 --strict
+ * Features:
+ * - Input: single string atau bulk (--input=names.txt, satu nama per baris)
+ * - Multi-engine search: SerpApi (jika SERPAPI_KEY ada), Bing scraping (tahan uji), DuckDuckGo HTML
+ * - Direct Probe: cek kandidat domain populer tanpa search (--probe=always/auto/off)
+ * - Extract: domain/TLD/hostname/Social username/title/snippet
+ * - Filters:
+ *     --strict  => hanya exact_domain, social_exact, org_title_exact
+ *     default   => juga menerima contains (domain_contains/social_contains/org_title_contains)
+ *     --allow-mentions => izinkan hasil yang hanya menyebut di body (default: drop)
+ * - Enrichment: WHOIS (gratis via whois-json), DNS resolve, crt.sh (JSON publik)
+ * - Output: JSON ke stdout + CSV per nama (--outdir) atau gabungan (--combine-csv) / single (--out)
+ * - Debug: --debug untuk inspect URL dari setiap engine & match result
  *
- *   # bulk
- *   node check_name_with_whois_crt.js --input=names.txt --limit=25 --combine-csv=all.csv --strict
- *
- * Flags:
- *   --mode=auto|serpapi|scrape
- *   --limit=NUMBER
- *   --out=file.csv (single mode)
- *   --outdir=out_csv (bulk: CSV per nama)
- *   --combine-csv=all.csv (bulk: satu CSV gabungan)
- *   --no-whois  --no-crt
- *   --strict  (hanya exact match di domain/username/title)
- *   --allow-mentions (izinkan hasil yang hanya “menyebut” di body; default: buang)
+ * Usage:
+ *   node check_name_with_whois_crt.js "Nama" [--limit=30] [--engine=auto|serpapi|bing|ddg|multi] [--probe=auto|always|off] [--strict] [--allow-mentions] [--no-whois] [--no-crt] [--out=file.csv]
+ *   node check_name_with_whois_crt.js --input=names.txt [--combine-csv=all.csv | --outdir=out_csv] [flags sama]
  */
 
 const fetch = require('node-fetch');
 const cheerio = require('cheerio');
-// p-limit ESM default export fix:
+// p-limit ESM default export fix (works with v3 or v5):
 let pLimit = require('p-limit'); pLimit = pLimit.default || pLimit;
 
 const { parse: parseDomain } = require('tldts');
@@ -38,7 +38,8 @@ const SERPAPI_KEY = process.env.SERPAPI_KEY || null;
 /* ---------- Utils ---------- */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const ensureDir = (p) => { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); };
-const slugify = (s) => (s || '').toLowerCase().normalize('NFKD').replace(/[^\p{Letter}\p{Number}]+/gu, '').trim();
+const slugLettersDigits = (s) => (s || '').toLowerCase().normalize('NFKD').replace(/[^\p{Letter}\p{Number}]+/gu, '');
+const safeSlug = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 
 function safeDomainInfo(urlStr) {
   try {
@@ -52,7 +53,7 @@ function safeDomainInfo(urlStr) {
 async function fetchPage(url, timeout = 15000) {
   try {
     const res = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; name-radar/1.2; +https://example.com)' },
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; name-radar/1.3; +https://example.com)' },
       redirect: 'follow', timeout
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -64,11 +65,10 @@ function extractTitleAndSnippet(html, maxWords = 60) {
   if (!html) return { title: null, snippet: null };
   const $ = cheerio.load(html);
   const title = ($('title').first().text() || '').trim() || null;
-  // Gunakan meta description kalau ada, JANGAN pakai preview Google
+
   let snippet = $('meta[name="description"]').attr('content') ||
                 $('meta[property="og:description"]').attr('content') || '';
   if (!snippet) {
-    // ambil paragraf awal (ringkas)
     const texts = [];
     $('p').each((i, el) => {
       const t = $(el).text().trim();
@@ -83,8 +83,8 @@ function extractTitleAndSnippet(html, maxWords = 60) {
   return { title, snippet: snippet || null };
 }
 
-/* ---------- Search ---------- */
-async function serpapiSearch(query, num = 20) {
+/* ---------- Search: SerpApi / Bing / DuckDuckGo ---------- */
+async function serpapiSearch(query, num = 20, debug = false) {
   if (!SERPAPI_KEY) throw new Error('No SERPAPI_KEY');
   const params = new URLSearchParams({ engine: 'google', q: query, api_key: SERPAPI_KEY, num: String(Math.min(num, 100)) });
   const url = `https://serpapi.com/search.json?${params}`;
@@ -93,33 +93,75 @@ async function serpapiSearch(query, num = 20) {
   const j = await res.json();
   const list = [];
   (j.organic_results || []).forEach(r => { if (r.link) list.push(r.link); else if (r.url) list.push(r.url); });
+  if (debug) console.log('[DEBUG] serpapi urls:', list);
   return list.slice(0, num);
 }
 
-async function bingScrapeSearch(q, num = 20) {
-  const qs = encodeURIComponent(q);
-  const url = `https://www.bing.com/search?q=${qs}&count=${Math.min(num, 50)}`;
+async function bingScrapeSearch(q, num = 20, debug = false) {
+  const take = Math.min(num, 50);
+  const urls = [];
+  let first = 0;
+  for (let page = 0; page < 3 && urls.length < num; page++) {
+    const qs = new URLSearchParams({ q, count: String(take), first: String(first) }).toString();
+    const url = `https://www.bing.com/search?${qs}`;
+    const html = await fetchPage(url);
+    if (!html) break;
+    const $ = cheerio.load(html);
+    $('li.b_algo, .b_algo, ol#b_results > li').each((i, el) => {
+      if (urls.length >= num) return false;
+      const a = $(el).find('h2 a').attr('href') ||
+                $(el).find('a[href^="http"]').attr('href');
+      if (a && a.startsWith('http')) urls.push(a);
+    });
+    first += take;
+  }
+  const uniq = [...new Set(urls)].slice(0, num);
+  if (debug) console.log('[DEBUG] bing urls:', uniq);
+  return uniq;
+}
+
+async function ddgHtmlSearch(q, num = 20, debug = false) {
+  const qs = new URLSearchParams({ q, s: '0' }).toString();
+  const url = `https://duckduckgo.com/html/?${qs}`;
   const html = await fetchPage(url);
   if (!html) return [];
   const $ = cheerio.load(html);
   const urls = [];
-  $('.b_algo').each((i, el) => {
+  $('a.result__a, a.result__url, div.result h2 a').each((i, el) => {
     if (urls.length >= num) return false;
-    const a = $(el).find('h2 a').attr('href') || $(el).find('a').attr('href');
-    if (a && a.startsWith('http')) urls.push(a);
+    const href = $(el).attr('href');
+    if (href && href.startsWith('http')) urls.push(href);
   });
-  return urls.slice(0, num);
+  const uniq = [...new Set(urls)].slice(0, num);
+  if (debug) console.log('[DEBUG] ddg urls:', uniq);
+  return uniq;
 }
 
 async function searchUrlsForName(name, opts = {}) {
-  const { mode = 'auto', limit = 30 } = opts;
+  const { mode = 'auto', limit = 30, engine = 'auto', debug = false } = opts;
   const quoted = `"${name}"`;
-  // Fokus ke title & url; intext tetap, tapi nanti disaring.
   const query = `intitle:${quoted} OR inurl:${name} OR "${name}"`;
-  if ((mode === 'auto' || mode === 'serpapi') && SERPAPI_KEY) {
-    try { return await serpapiSearch(query, limit); } catch {}
+
+  const tryList = [];
+  if (engine === 'serpapi' || engine === 'auto') tryList.push('serpapi');
+  if (engine === 'bing'     || engine === 'auto' || engine === 'multi') tryList.push('bing');
+  if (engine === 'ddg'      || engine === 'auto' || engine === 'multi') tryList.push('ddg');
+
+  for (const eng of tryList) {
+    try {
+      if (eng === 'serpapi' && SERPAPI_KEY) {
+        const r = await serpapiSearch(query, limit, debug);
+        if (r.length) return r;
+      } else if (eng === 'bing') {
+        const r = await bingScrapeSearch(query, limit, debug);
+        if (r.length) return r;
+      } else if (eng === 'ddg') {
+        const r = await ddgHtmlSearch(query, limit, debug);
+        if (r.length) return r;
+      }
+    } catch (_) { /* continue */ }
   }
-  return await bingScrapeSearch(query, limit);
+  return [];
 }
 
 /* ---------- WHOIS / DNS / crt.sh ---------- */
@@ -160,13 +202,13 @@ async function checkCrtSh(domain) {
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
-/* ---------- Matching rules ---------- */
+/* ---------- Social parsing ---------- */
 const SOCIAL_PLATFORMS = [
   { hostRe: /(^|\.)instagram\.com$/i,               platform: 'instagram', usernamePathIndex: 1 },
-  { hostRe: /(^|\.)tiktok\.com$/i,                  platform: 'tiktok',    usernamePathIndex: 1 }, // /@username -> handle dimulai '@'
+  { hostRe: /(^|\.)tiktok\.com$/i,                  platform: 'tiktok',    usernamePathIndex: 1 },
   { hostRe: /(^|\.)twitter\.com$|(^|\.)x\.com$/i,   platform: 'twitter',   usernamePathIndex: 1 },
   { hostRe: /(^|\.)facebook\.com$/i,                platform: 'facebook',  usernamePathIndex: 1 },
-  { hostRe: /(^|\.)youtube\.com$/i,                 platform: 'youtube',   usernamePathIndex: 1 }, // /@handle atau /c/...
+  { hostRe: /(^|\.)youtube\.com$/i,                 platform: 'youtube',   usernamePathIndex: 1 },
   { hostRe: /(^|\.)linktr\.ee$/i,                   platform: 'linktree',  usernamePathIndex: 1 },
   { hostRe: /(^|\.)msha\.ke$/i,                     platform: 'milkshake', usernamePathIndex: 1 },
   { hostRe: /(^|\.)github\.com$/i,                  platform: 'github',    usernamePathIndex: 1 },
@@ -174,23 +216,19 @@ const SOCIAL_PLATFORMS = [
   { hostRe: /(^|\.)medium\.com$/i,                  platform: 'medium',    usernamePathIndex: 1 }
 ];
 
-// Ambil username dari path jika host cocok
 function extractSocialUsername(u) {
   try {
     const url = new URL(u);
     const host = url.hostname.toLowerCase();
-    const pathParts = url.pathname.split('/').filter(Boolean); // buang '' kosong
+    const pathParts = url.pathname.split('/').filter(Boolean);
     for (const p of SOCIAL_PLATFORMS) {
       if (p.hostRe.test(host)) {
         let username = pathParts[p.usernamePathIndex] || '';
-        // TikTok & YouTube bisa pakai '@handle'
         if (username.startsWith('@')) username = username.slice(1);
-        // YouTube: /channel/ atau /c/ atau /@handle
         if (/youtube\.com$/.test(host)) {
           if (pathParts[0] === '@') username = pathParts[1] || username;
           if (pathParts[0] === 'channel' || pathParts[0] === 'c') username = pathParts[1] || username;
         }
-        // Facebook: bisa /profile.php?id=... (abaikan)
         if (/facebook\.com$/.test(host) && username.includes('.php')) username = '';
         return { platform: p.platform, username: username || null };
       }
@@ -199,42 +237,47 @@ function extractSocialUsername(u) {
   } catch { return { platform: null, username: null }; }
 }
 
-// Skoring & klasifikasi
+/* ---------- Matching rules ---------- */
 function classifyMatch(nameRaw, result) {
-  const q = slugify(nameRaw);
-  const titleSlug = slugify(result.title || '');
-  const sldSlug = slugify(result.sld || ''); // second-level (tanpa TLD)
-  const hostSlug = slugify(result.hostname || '');
+  const q = slugLettersDigits(nameRaw);
+  const titleSlug = slugLettersDigits(result.title || '');
+  const sldSlug = slugLettersDigits(result.sld || '');
+  const hostSlug = slugLettersDigits(result.hostname || '');
 
-  // Domain exact vs contains
   if (sldSlug && sldSlug === q) return { type: 'exact_domain', score: 100 };
-  if (sldSlug && sldSlug.includes(q)) return { type: 'domain_contains', score: 80 };
+  if (sldSlug && (sldSlug.includes(q) || q.includes(sldSlug))) return { type: 'domain_contains', score: 80 };
 
-  // Social username match
   const soc = extractSocialUsername(result.url);
   if (soc.username) {
-    const userSlug = slugify(soc.username);
+    const userSlug = slugLettersDigits(soc.username);
     if (userSlug === q) return { type: 'social_exact', score: 90, social: soc };
     if (userSlug.includes(q) || q.includes(userSlug)) return { type: 'social_contains', score: 70, social: soc };
   }
 
-  // Title organization match (PT/CV/Inc/Ltd/LLC/Company…)
   const orgTitle = /(^|\b)(pt|cv|inc|ltd|llc|company|perusahaan|studio|ventures|labs)\b/i.test(result.title || '');
   if (titleSlug === q && orgTitle) return { type: 'org_title_exact', score: 75 };
   if (titleSlug.includes(q) && orgTitle) return { type: 'org_title_contains', score: 60 };
 
-  // Mention only (di body/title tidak sesuai atau hanya artikel)
   return { type: 'mention', score: 20 };
 }
 
-/* ---------- Core per-name ---------- */
+/* ---------- Candidate domain probe ---------- */
+const COMMON_TLDS = ['com','net','org','io','co','id','co.id','ai','app','dev'];
+function buildCandidateDomains(name) {
+  const base = slugLettersDigits(name);
+  const variants = [base, base.replace(/-+/g,'')].filter(Boolean);
+  const candidates = [];
+  for (const s of variants) for (const tld of COMMON_TLDS) candidates.push(`${s}.${tld}`);
+  return [...new Set(candidates)];
+}
+
+/* ---------- Process URL for one name ---------- */
 async function processUrlForName(name, u, idx, concurrency) {
-  await sleep(120 * (idx % concurrency)); // stagger
+  await sleep(120 * (idx % concurrency));
   const html = await fetchPage(u);
   const { title, snippet } = extractTitleAndSnippet(html, 80);
   const dn = safeDomainInfo(u);
 
-  // dasar output
   const base = {
     url: u, domain: dn.domain, hostname: dn.hostname, tld: dn.tld, sld: dn.sld,
     title, snippet, match_type: 'unknown', match_score: 0,
@@ -249,40 +292,58 @@ async function processUrlForName(name, u, idx, concurrency) {
     base.social_platform = cls.social.platform;
     base.social_username = cls.social.username;
   }
-
   return base;
 }
 
+/* ---------- Core per-name ---------- */
 async function findNameUsage(name, options = {}) {
   const {
     limit = 40, concurrency = 6, mode = 'auto',
-    doWhois = true, doCrt = true, allowMentions = false, strict = false
+    doWhois = true, doCrt = true, allowMentions = false, strict = false,
+    engine = 'auto', debug = false, probe = 'auto'
   } = options;
 
-  const urls = await searchUrlsForName(name, { mode, limit });
-  if (!urls || urls.length === 0) return { name, found: 0, results: [] };
-
   const limitFn = pLimit(concurrency);
+
+  // 0) Direct probe (exact domains) — run first so selalu muncul walau search kosong
+  let probeResults = [];
+  if (probe === 'always' || probe === 'auto') {
+    const candidates = buildCandidateDomains(name);
+    const checks = candidates.map(d => limitFn(async () => {
+      const dn = { domain: d, hostname: d, tld: d.split('.').slice(1).join('.'), sld: d.split('.')[0] };
+      const r = {
+        url: `http://${d}`, domain: d, hostname: d, tld: dn.tld, sld: dn.sld,
+        title: null, snippet: null, match_type: 'exact_domain', match_score: 100,
+        social_platform: null, social_username: null, whois: null, dns: null, crt: null
+      };
+      r.whois = doWhois ? await checkWhois(d).catch(e => ({ ok:false, error:e.message })) : null;
+      r.dns   =            await checkDns(d).catch(e   => ({ resolves:false, error:e.message, records:[] }));
+      r.crt   = doCrt   ? await checkCrtSh(d).catch(e => ({ ok:false, error:e.message })) : null;
+      return r;
+    }));
+    probeResults = await Promise.all(checks);
+    if (debug) console.log('[DEBUG] probe domains:', candidates);
+  }
+
+  // 1) Search
+  const urls = await searchUrlsForName(name, { mode, limit, engine, debug });
   const processed = await Promise.all(
     urls.map((u, i) => limitFn(() => processUrlForName(name, u, i, concurrency)))
   );
 
-  // Filter hasil sesuai aturan:
-  const accepted = processed.filter(r => {
-    // buang mention-only kecuali allowMentions
+  let combined = [...probeResults, ...processed];
+
+  // 2) Filter hasil sesuai aturan
+  combined = combined.filter(r => {
     if (!allowMentions && r.match_type === 'mention') return false;
-    // strict: hanya exact* & social_exact
-    if (strict) {
-      return ['exact_domain','social_exact','org_title_exact'].includes(r.match_type);
-    }
-    // non-strict: terima domain_contains & social_contains juga
+    if (strict) return ['exact_domain','social_exact','org_title_exact'].includes(r.match_type);
     return ['exact_domain','domain_contains','social_exact','social_contains','org_title_exact','org_title_contains'].includes(r.match_type);
   });
 
-  // dedupe per "key utama": exact domain > social > lainnya
+  // 3) Dedupe (prioritaskan skor lebih tinggi)
   const seen = new Set();
   const dedup = [];
-  for (const r of accepted.sort((a,b) => b.match_score - a.match_score)) {
+  for (const r of combined.sort((a,b) => b.match_score - a.match_score)) {
     const key = (r.match_type.startsWith('social') && r.social_platform && r.social_username)
       ? `${r.social_platform}:${r.social_username}`.toLowerCase()
       : (r.domain || r.hostname || r.url || '').toLowerCase();
@@ -291,14 +352,16 @@ async function findNameUsage(name, options = {}) {
     dedup.push(r);
   }
 
-  // WHOIS/DNS/CRT (best-effort)
+  // 4) Enrichment untuk hasil dari search (probe sudah diperkaya)
   for (const r of dedup) {
+    if (probeResults.find(pr => pr.domain === r.domain)) continue; // sudah enriched
     if (r.domain) {
       if (doWhois) r.whois = await checkWhois(r.domain).catch(e => ({ ok: false, error: e.message }));
       r.dns = await checkDns(r.domain).catch(e => ({ resolves: false, error: e.message, records: [] }));
       if (doCrt) r.crt = await checkCrtSh(r.domain).catch(e => ({ ok: false, error: e.message }));
-      await sleep(120);
+      await sleep(100);
     }
+    if (debug) console.log('[DEBUG] match', { type: r.match_type, score: r.match_score, domain: r.domain, url: r.url });
   }
 
   return { name, found: dedup.length, results: dedup };
@@ -392,6 +455,8 @@ async function main() {
   const inputFile = flags.input || null;
   const limit = parseInt(flags.limit || '30', 10);
   const mode = flags.mode || 'auto';
+  const engine = flags.engine || 'auto'; // auto|serpapi|bing|ddg|multi
+  const probe = flags.probe || 'auto';   // auto|always|off
   const out = flags.out || null;
   const outdir = flags.outdir || null;
   const combineCsv = flags['combine-csv'] || null;
@@ -399,6 +464,7 @@ async function main() {
   const doCrt = !flags['no-crt'];
   const strict = !!flags['strict'];
   const allowMentions = !!flags['allow-mentions'];
+  const debug = !!flags['debug'];
 
   let names = [];
   if (inputFile) {
@@ -411,23 +477,22 @@ async function main() {
   } else if (positionalName) {
     names = [positionalName];
   } else {
-    console.log('Usage:\n  node check_name_with_whois_crt.js "NameString" [--limit=30] [--mode=auto|serpapi|scrape] [--out=file.csv] [--no-whois] [--no-crt] [--strict]\n  node check_name_with_whois_crt.js --input=names.txt [--limit=25] [--combine-csv=all.csv | --outdir=out_csv] [--no-whois] [--no-crt] [--strict]');
+    console.log('Usage:\n  node check_name_with_whois_crt.js "NameString" [--limit=30] [--mode=auto|serpapi|scrape] [--engine=auto|serpapi|bing|ddg|multi] [--probe=auto|always|off] [--out=file.csv] [--no-whois] [--no-crt] [--strict] [--allow-mentions] [--debug]\n  node check_name_with_whois_crt.js --input=names.txt [--combine-csv=all.csv | --outdir=out_csv] [same flags]');
     process.exit(1);
   }
 
-  console.log(`Mode: ${inputFile ? 'BULK' : 'SINGLE'} | limit=${limit} | whois=${doWhois} | crt=${doCrt} | strict=${strict} | allowMentions=${allowMentions}`);
+  console.log(`Mode: ${inputFile ? 'BULK' : 'SINGLE'} | limit=${limit} | engine=${engine} | probe=${probe} | whois=${doWhois} | crt=${doCrt} | strict=${strict} | allowMentions=${allowMentions}`);
   if (inputFile) console.log(`Input file: ${inputFile}`);
 
   const allRowsForCombined = [];
   for (const name of names) {
     console.log(`\n>>> Checking: "${name}"`);
     try {
-      const res = await findNameUsage(name, { limit, mode, doWhois, doCrt, strict, allowMentions });
-      // tambahkan query_name ke setiap result
+      const res = await findNameUsage(name, { limit, mode, doWhois, doCrt, strict, allowMentions, engine, debug, probe });
       res.results.forEach(r => r.query_name = name);
-
       const rows = mapRowsForCsv(res.results);
-      console.log(JSON.stringify({ meta: { name, mode, limit, found: res.found } }, null, 2));
+
+      console.log(JSON.stringify({ meta: { name, mode, engine, limit, found: res.found } }, null, 2));
 
       if (inputFile) {
         if (combineCsv) allRowsForCombined.push(...rows);
@@ -436,7 +501,10 @@ async function main() {
           console.log(`Saved CSV: ${p}`);
         }
       } else if (out) {
-        const writer = createObjectCsvWriter({ path: out, header: Object.keys(rows[0] || {}).map(k => ({ id: k, title: k })) });
+        const writer = createObjectCsvWriter({
+          path: out,
+          header: Object.keys(rows[0] || { placeholder: '' }).map(k => ({ id: k, title: k }))
+        });
         await writer.writeRecords(rows);
         console.log(`Saved CSV: ${out}`);
       }
