@@ -54,6 +54,11 @@ Open PowerShell at the repository root.
 node .\\check_name_with_whois_crt.js "MyStartupName"
 ```
 
+# Single name with limit
+```powershell
+node .\\check_name_with_whois_crt.js "MyStartupName" --limit=30
+```
+
 # Single name, save per-run CSV
 ```powershell
 node .\\check_name_with_whois_crt.js "MyStartupName" --out=results.csv
