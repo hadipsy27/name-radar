@@ -2,6 +2,30 @@
 
 Cek pemakaian **nama brand/startup/PT/domain/username sosmed** secara cepat. Tool Node.js ini melakukan pencarian lintas mesin (SerpApi/Bing/DuckDuckGo), mem‑probe domain kandidat populer, dan memperkaya hasil dengan **WHOIS, DNS**, dan **crt.sh (Certificate Transparency)** — semuanya bisa berjalan **gratis** (tanpa API key), dengan opsi SerpApi jika tersedia.
 
+## 🆕 Versi Professional Tersedia!
+
+**Name Radar Professional** kini hadir dengan fitur-fitur enterprise:
+- ✅ **Validasi nama bisnis** sesuai regulasi PT/CV/UD/Firma Indonesia
+- ✅ **Sistem scoring komprehensif** (0-100) dengan 5 aspek penilaian
+- ✅ **Executive summary** & rekomendasi profesional
+- ✅ **Analisis kompetitor** & risiko trademark
+- ✅ **Laporan Excel multi-sheet** dengan formatting profesional
+- ✅ **SEO & branding score** untuk brand yang memorable
+
+📖 **[Lihat dokumentasi lengkap versi Professional →](README_PROFESSIONAL.md)**
+
+### Quick Start (Professional Mode)
+```bash
+# Install dependencies
+npm install
+
+# Analisis nama PT/Startup/Perusahaan
+npm run check "PT Digital Nusantara"
+
+# Atau langsung:
+node check_name_professional.js "YourBusinessName"
+```
+
 ---
 
 ## Fitur Utama
