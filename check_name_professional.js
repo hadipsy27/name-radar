@@ -28,6 +28,7 @@ const { URL } = require('url');
 
 // Import professional modules
 const { generateProfessionalReport } = require('./src/modules/reporter');
+const { probeSocialMedia, getSocialSummary } = require('./src/modules/social-probe');
 const {
   validateBusinessName,
   detectEntityType,
@@ -423,16 +424,73 @@ async function findNameUsage(name, options = {}) {
     }
   }
 
+  // 4.5) Direct Social Media Probing
+  console.log('\n📱 Verifying social media accounts...');
+  const cleanName = toDomainBase(name); // Get clean version for social media
+  const socialProbeResults = await probeSocialMedia(cleanName, {
+    platforms: ['instagram', 'facebook', 'youtube', 'twitter', 'tiktok', 'linkedin', 'github'],
+    delay: 800,
+    debug
+  });
+
+  // Create social media result entries for platforms found in probe
+  const socialResults = [];
+  Object.entries(socialProbeResults).forEach(([platform, probeData]) => {
+    // Check if we already have this from search results
+    const existingResult = dedup.find(r =>
+      r.social_platform === platform && r.social_username === cleanName
+    );
+
+    if (existingResult) {
+      // Update existing result with verified probe data
+      existingResult.social_verified = true;
+      existingResult.social_probe_status = probeData.status;
+      existingResult.social_probe_confidence = probeData.confidence;
+      existingResult.social_exists = probeData.exists;
+    } else {
+      // Create new result entry for this social platform
+      const socialResult = {
+        url: probeData.url,
+        domain: null,
+        hostname: null,
+        tld: null,
+        sld: null,
+        title: null,
+        snippet: null,
+        match_type: probeData.status === 'taken' ? 'social_exact' : 'social_probe',
+        match_score: probeData.status === 'taken' ? 90 : 0,
+        social_platform: platform,
+        social_username: cleanName,
+        social_verified: true,
+        social_probe_status: probeData.status,
+        social_probe_confidence: probeData.confidence,
+        social_exists: probeData.exists,
+        whois: null,
+        dns: null,
+        crt: null,
+        origin: 'social_probe'
+      };
+
+      // Only add if status is 'taken' or we want to show all candidates
+      if (probeData.status === 'taken' || !onlyFound) {
+        socialResults.push(socialResult);
+      }
+    }
+  });
+
+  // Merge social results
+  const allResults = [...dedup, ...socialResults];
+
   // 5) Filter results with evidence
   const filtered = [];
-  for (const r of dedup) {
+  for (const r of allResults) {
     const sources = computeUsageSources(r);
     if (!onlyFound || sources.length > 0) filtered.push(r);
   }
 
   console.log(`\n✅ Analysis complete: ${filtered.length} results found`);
 
-  return { name, found: filtered.length, results: filtered };
+  return { name, found: filtered.length, results: filtered, socialProbeResults };
 }
 
 /* ---------- usage_detected_from ---------- */

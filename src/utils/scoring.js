@@ -133,7 +133,9 @@ function calculateDomainScore(results) {
  * Calculate social media availability score
  */
 function calculateSocialScore(results) {
-  const socialResults = results.filter(r => r.match_type.includes('social'));
+  const socialResults = results.filter(r =>
+    r.social_platform || r.match_type.includes('social')
+  );
   const score = { score: 0, details: {} };
 
   const criticalPlatforms = ['instagram', 'facebook', 'linkedin', 'twitter'];
@@ -141,7 +143,17 @@ function calculateSocialScore(results) {
 
   criticalPlatforms.forEach(platform => {
     const found = socialResults.find(r => r.social_platform === platform);
-    platformStatus[platform] = found ? 'taken' : 'available';
+
+    if (found && found.social_verified) {
+      // Use verified probe status
+      platformStatus[platform] = found.social_probe_status === 'taken' ? 'taken' : 'available';
+    } else if (found) {
+      // Found in search results but not verified
+      platformStatus[platform] = 'taken';
+    } else {
+      // Not found anywhere
+      platformStatus[platform] = 'available';
+    }
   });
 
   score.details.platforms = platformStatus;

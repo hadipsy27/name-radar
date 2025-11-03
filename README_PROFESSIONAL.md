@@ -17,10 +17,12 @@
 1. **Executive Summary** - Overview dengan score dan rekomendasi
 2. **Detailed Results** - Data lengkap semua temuan
 3. **Domain Analysis** - Status ketersediaan domain per TLD
-4. **Social Media** - Ketersediaan handle di platform utama
+4. **Social Media** - ✨ **NEW: Direct Verification!** Ketersediaan handle di platform utama
 5. **SEO & Branding** - Analisis SEO dan validasi nama bisnis
 6. **Competitor Analysis** - Daftar kompetitor dan tingkat ancaman
 7. **Recommendations** - Rekomendasi aksi berdasarkan prioritas
+
+> 📱 **NEW FEATURE**: **Direct Social Media Verification!** Tool sekarang langsung meng-check apakah username tersedia di Instagram, Facebook, YouTube, Twitter, LinkedIn, TikTok, dan GitHub dengan HTTP probing. Tidak lagi mengandalkan search results saja! Lihat [SOCIAL_MEDIA_VERIFICATION.md](SOCIAL_MEDIA_VERIFICATION.md) untuk detail lengkap.
 
 ### 🔍 Sistem Scoring (0-100)
 
@@ -29,9 +31,10 @@
 - Status: Available / Taken / Unknown
 - Verifikasi WHOIS, DNS, dan Certificate Transparency
 
-#### 2. Social Media Availability (25%)
+#### 2. Social Media Availability (25%) ✨
 - Platform kritis: Instagram, Facebook, LinkedIn, Twitter
-- Deteksi handle yang sudah digunakan
+- **Direct verification** dengan HTTP probing
+- Status: Taken (Verified) / Available (Verified) / Check Manually
 - Rekomendasi platform alternatif
 
 #### 3. Trademark Risk (20%)
