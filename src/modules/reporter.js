@@ -400,14 +400,36 @@ async function createSocialMediaSheet(workbook, name, results, brandScore) {
     sheet.getCell(row, 2).value = `@${cleanName}`;
 
     const statusCell = sheet.getCell(row, 3);
-    if (found) {
-      statusCell.value = 'Taken';
+
+    // Use verified probe data if available
+    if (found && found.social_verified) {
+      const probeStatus = found.social_probe_status;
+      const confidence = found.social_probe_confidence;
+
+      if (probeStatus === 'taken') {
+        statusCell.value = `Taken (Verified)`;
+        statusCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFC7CE' } }; // Red
+        sheet.getCell(row, 4).value = found.url;
+      } else if (probeStatus === 'available') {
+        statusCell.value = `Available (Verified)`;
+        statusCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '00B050' } }; // Green
+        statusCell.font = { color: { argb: 'FFFFFF' } };
+        sheet.getCell(row, 4).value = found.url;
+      } else {
+        // Unknown status - couldn't verify
+        statusCell.value = `Check Manually`;
+        statusCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEB9C' } }; // Yellow
+        sheet.getCell(row, 4).value = found.url;
+      }
+    } else if (found) {
+      // Found in search but not verified
+      statusCell.value = 'Taken (Found in Search)';
       statusCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFC7CE' } }; // Red
       sheet.getCell(row, 4).value = found.url;
     } else {
-      statusCell.value = 'Likely Available';
-      statusCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '00B050' } }; // Green
-      statusCell.font = { color: { argb: 'FFFFFF' } };
+      // Not found at all - check manually to be sure
+      statusCell.value = 'Check Manually';
+      statusCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEB9C' } }; // Yellow
       sheet.getCell(row, 4).value = `https://www.${platform}.com/${cleanName}`;
     }
 
