@@ -1,24 +1,21 @@
 /**
- * check_name_with_whois_crt.js — All-in-One (Excel output)
+ * check_name_with_whois_crt.js — All-in-One (Excel output + usage_detected_from + hyphen-safe)
  *
  * Fitur:
  * - Single & Bulk (--input=names.txt)
  * - Multi-engine search: SerpApi (opsional via .env), Bing scraping, DuckDuckGo HTML
- * - Direct Probe kandidat domain populer (.com .net .org .io .co .id .co.id .ai .app .dev)
- * - Filter ketat (exact domain / social username / org title) + --strict / --allow-mentions
+ * - Direct Probe kandidat TLD populer (.com .net .org .io .co .id .co.id .ai .app .dev)
+ * - Filter kuat (exact domain / social username / org title) + --strict / --allow-mentions
  * - Enrichment: WHOIS, DNS, crt.sh
- * - Output: Excel .xlsx (stabil per kolom; auto-filter; auto width)
- * - Debug mode
- *
- * Contoh:
- *   node check_name_with_whois_crt.js "LinkPulse" --engine=multi --probe=always --limit=30 --strict --debug --out=linkpulse.xlsx
- *   node check_name_with_whois_crt.js --input=names.txt --engine=multi --probe=auto --limit=25 --strict --combine-xlsx=all.xlsx
- *   node check_name_with_whois_crt.js --input=names.txt --outdir-xlsx=out_xlsx
+ * - Output: Excel .xlsx (stabil per kolom; auto-filter; auto width) — fallback CSV jika exceljs tak ada
+ * - Kolom: usage_detected_from (WHOIS;DNS;crt.sh;social;org_title;domain_present;search_hit;probe_hit)
+ * - Kolom terakhir: available (heuristik konservatif)
+ * - Hyphen-preserving: "astra-honda" tetap dipakai apa adanya; sanitasi domain-friendly
+ * - Default hanya tampilkan hasil "ketemu" (use --show-candidates untuk tampilkan kandidat kosong)
  */
 
 const fetch = require('node-fetch');
 const cheerio = require('cheerio');
-// p-limit ESM default export fix (works with v3 or v5):
 let pLimit = require('p-limit'); pLimit = pLimit.default || pLimit;
 
 const { parse: parseDomain } = require('tldts');
@@ -26,7 +23,7 @@ const fs = require('fs');
 const path = require('path');
 const whois = require('whois-json');
 const dns = require('dns').promises;
-const ExcelJS = require('exceljs');
+let ExcelJS = null; try { ExcelJS = require('exceljs'); } catch (_) {}
 require('dotenv').config();
 const { URL } = require('url');
 
@@ -35,7 +32,30 @@ const SERPAPI_KEY = process.env.SERPAPI_KEY || null;
 /* ---------- Utils ---------- */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const ensureDir = (p) => { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); };
-const slugLettersDigits = (s) => (s || '').toLowerCase().normalize('NFKD').replace(/[^\p{Letter}\p{Number}]+/gu, '');
+
+// Untuk perbandingan nama → tetap izinkan huruf, digit, dan hyphen
+const slugLettersDigitsHyphen = (s) =>
+  (s || '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^\p{Letter}\p{Number}-]+/gu, ''); // keep '-'
+
+// Sanitasi nama untuk base domain (allowed: a-z, 0-9, '-')
+// - spasi & underscore → '-'
+// - hapus selain [a-z0-9-]
+// - kompres '--' → '-'
+// - trim '-' di awal/akhir
+function toDomainBase(name) {
+  return (name || '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\s_]+/g, '-')          // space/underscore -> hyphen
+    .replace(/[^a-z0-9-]+/g, '')      // keep only a-z 0-9 -
+    .replace(/-+/g, '-')              // collapse ---- -> -
+    .replace(/^-+/, '')               // trim leading -
+    .replace(/-+$/, '');              // trim trailing -
+}
+
 const safeDomainInfo = (urlStr) => {
   try {
     const u = new URL(urlStr);
@@ -48,7 +68,7 @@ const safeDomainInfo = (urlStr) => {
 async function fetchPage(url, timeout = 15000) {
   try {
     const res = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; name-radar/1.5; +https://example.com)' },
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; name-radar/1.7; +https://example.com)' },
       redirect: 'follow', timeout
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -78,7 +98,7 @@ function extractTitleAndSnippet(html, maxWords = 60) {
   return { title, snippet: snippet || null };
 }
 
-/* ---------- Search: SerpApi / Bing / DuckDuckGo ---------- */
+/* ---------- Search engines ---------- */
 async function serpapiSearch(query, num = 20, debug = false) {
   if (!SERPAPI_KEY) throw new Error('No SERPAPI_KEY');
   const params = new URLSearchParams({ engine: 'google', q: query, api_key: SERPAPI_KEY, num: String(Math.min(num, 100)) });
@@ -134,6 +154,7 @@ async function ddgHtmlSearch(q, num = 20, debug = false) {
 async function searchUrlsForName(name, opts = {}) {
   const { limit = 30, engine = 'auto', debug = false } = opts;
   const quoted = `"${name}"`;
+  // izinkan hyphen dalam query (apa adanya)
   const query = `intitle:${quoted} OR inurl:${name} OR "${name}"`;
 
   const tryList = [];
@@ -207,7 +228,8 @@ const SOCIAL_PLATFORMS = [
   { hostRe: /(^|\.)msha\.ke$/i,                     platform: 'milkshake', usernamePathIndex: 1 },
   { hostRe: /(^|\.)github\.com$/i,                  platform: 'github',    usernamePathIndex: 1 },
   { hostRe: /(^|\.)behance\.net$/i,                 platform: 'behance',   usernamePathIndex: 1 },
-  { hostRe: /(^|\.)medium\.com$/i,                  platform: 'medium',    usernamePathIndex: 1 }
+  { hostRe: /(^|\.)medium\.com$/i,                  platform: 'medium',    usernamePathIndex: 1 },
+  { hostRe: /(^|\.)linkedin\.com$/i,                platform: 'linkedin',  usernamePathIndex: 1 }, // added
 ];
 
 function extractSocialUsername(u) {
@@ -215,7 +237,19 @@ function extractSocialUsername(u) {
     const url = new URL(u);
     const host = url.hostname.toLowerCase();
     const pathParts = url.pathname.split('/').filter(Boolean);
+
+    // LinkedIn special handling
+    if (/linkedin\.com$/.test(host)) {
+      const head = pathParts[0] || '';
+      const map = new Set(['in','company','school','showcase']);
+      const uidx = map.has(head) ? 1 : 0;
+      let username = pathParts[uidx] || '';
+      if (username.startsWith('@')) username = username.slice(1);
+      return { platform: 'linkedin', username: username || null };
+    }
+
     for (const p of SOCIAL_PLATFORMS) {
+      if (p.platform === 'linkedin') continue; // handled above
       if (p.hostRe.test(host)) {
         let username = pathParts[p.usernamePathIndex] || '';
         if (username.startsWith('@')) username = username.slice(1);
@@ -231,18 +265,18 @@ function extractSocialUsername(u) {
   } catch { return { platform: null, username: null }; }
 }
 
-/* ---------- Matching rules ---------- */
+/* ---------- Matching ---------- */
 function classifyMatch(nameRaw, result) {
-  const q = slugLettersDigits(nameRaw);
-  const titleSlug = slugLettersDigits(result.title || '');
-  const sldSlug = slugLettersDigits(result.sld || '');
+  const q = slugLettersDigitsHyphen(nameRaw);
+  const titleSlug = slugLettersDigitsHyphen(result.title || '');
+  const sldSlug = slugLettersDigitsHyphen(result.sld || '');
 
   if (sldSlug && sldSlug === q) return { type: 'exact_domain', score: 100 };
   if (sldSlug && (sldSlug.includes(q) || q.includes(sldSlug))) return { type: 'domain_contains', score: 80 };
 
   const soc = extractSocialUsername(result.url);
   if (soc.username) {
-    const userSlug = slugLettersDigits(soc.username);
+    const userSlug = slugLettersDigitsHyphen(soc.username);
     if (userSlug === q) return { type: 'social_exact', score: 90, social: soc };
     if (userSlug.includes(q) || q.includes(userSlug)) return { type: 'social_contains', score: 70, social: soc };
   }
@@ -254,17 +288,17 @@ function classifyMatch(nameRaw, result) {
   return { type: 'mention', score: 20 };
 }
 
-/* ---------- Candidate domain probe ---------- */
+/* ---------- Candidate domains (hyphen-safe) ---------- */
 const COMMON_TLDS = ['com','net','org','io','co','id','co.id','ai','app','dev'];
 function buildCandidateDomains(name) {
-  const base = slugLettersDigits(name);
-  const variants = [base, base.replace(/-+/g,'')].filter(Boolean);
+  const base = toDomainBase(name); // keep hyphen
+  const variants = [base].filter(Boolean); // tidak menghapus hyphen
   const candidates = [];
   for (const s of variants) for (const tld of COMMON_TLDS) candidates.push(`${s}.${tld}`);
   return [...new Set(candidates)];
 }
 
-/* ---------- Process URL for one name ---------- */
+/* ---------- Process URL ---------- */
 async function processUrlForName(name, u, idx, concurrency) {
   await sleep(120 * (idx % concurrency));
   const html = await fetchPage(u);
@@ -275,7 +309,8 @@ async function processUrlForName(name, u, idx, concurrency) {
     url: u, domain: dn.domain, hostname: dn.hostname, tld: dn.tld, sld: dn.sld,
     title, snippet, match_type: 'unknown', match_score: 0,
     social_platform: null, social_username: null,
-    whois: null, dns: null, crt: null
+    whois: null, dns: null, crt: null,
+    origin: 'search'
   };
 
   const cls = classifyMatch(name, { ...dn, url: u, title });
@@ -293,12 +328,12 @@ async function findNameUsage(name, options = {}) {
   const {
     limit = 40, concurrency = 6,
     doWhois = true, doCrt = true, allowMentions = false, strict = false,
-    engine = 'auto', debug = false, probe = 'auto'
+    engine = 'auto', debug = false, probe = 'auto', onlyFound = true
   } = options;
 
   const limitFn = pLimit(concurrency);
 
-  // 0) Direct probe (exact domains)
+  // 0) Direct probe
   let probeResults = [];
   if (probe === 'always' || probe === 'auto') {
     const candidates = buildCandidateDomains(name);
@@ -307,7 +342,8 @@ async function findNameUsage(name, options = {}) {
       const r = {
         url: `http://${d}`, domain: d, hostname: d, tld: dn.tld, sld: dn.sld,
         title: null, snippet: null, match_type: 'exact_domain', match_score: 100,
-        social_platform: null, social_username: null, whois: null, dns: null, crt: null
+        social_platform: null, social_username: null, whois: null, dns: null, crt: null,
+        origin: 'probe'
       };
       r.whois = doWhois ? await checkWhois(d).catch(e => ({ ok:false, error:e.message })) : null;
       r.dns   =            await checkDns(d).catch(e   => ({ resolves:false, error:e.message, records:[] }));
@@ -333,7 +369,7 @@ async function findNameUsage(name, options = {}) {
     return ['exact_domain','domain_contains','social_exact','social_contains','org_title_exact','org_title_contains'].includes(r.match_type);
   });
 
-  // 3) Dedupe (prioritaskan skor tinggi)
+  // 3) Dedupe
   const seen = new Set();
   const dedup = [];
   for (const r of combined.sort((a,b) => b.match_score - a.match_score)) {
@@ -345,7 +381,7 @@ async function findNameUsage(name, options = {}) {
     dedup.push(r);
   }
 
-  // 4) Enrichment untuk hasil dari search (probe sudah enriched)
+  // 4) Enrichment for search results (probe already enriched)
   for (const r of dedup) {
     if (probeResults.find(pr => pr.domain === r.domain)) continue;
     if (r.domain) {
@@ -357,17 +393,48 @@ async function findNameUsage(name, options = {}) {
     if (debug) console.log('[DEBUG] match', { type: r.match_type, score: r.match_score, domain: r.domain, url: r.url });
   }
 
-  return { name, found: dedup.length, results: dedup };
+  // 5) Hanya hasil yang ada “bukti” (default), kecuali --show-candidates
+  const filtered = [];
+  for (const r of dedup) {
+    const sources = computeUsageSources(r);
+    if (!onlyFound || sources.length > 0) filtered.push(r);
+  }
+
+  return { name, found: filtered.length, results: filtered };
 }
 
-/* ---------- Row mapping & availability heuristic ---------- */
+/* ---------- usage_detected_from & availability ---------- */
+function computeUsageSources(r) {
+  const sources = [];
+  const whoisOk = r.whois && r.whois.ok;
+  const whoisLikely = whoisOk ? !!r.whois.likelyAvailable : false;
+  const dnsResolves = r.dns && r.dns.resolves ? true : false;
+  const crtCount = (r.crt && r.crt.ok && Array.isArray(r.crt.entries)) ? r.crt.entries.length : 0;
+
+  if (whoisOk && !whoisLikely) sources.push('WHOIS');
+  if (dnsResolves) sources.push('DNS');
+  if (crtCount > 0) sources.push('crt.sh');
+
+  if (r.match_type === 'social_exact' || r.match_type === 'social_contains') sources.push('social');
+  if (r.match_type === 'org_title_exact' || r.match_type === 'org_title_contains') sources.push('org_title');
+  if (r.match_type === 'exact_domain' || r.match_type === 'domain_contains') sources.push('domain_present');
+
+  if (r.origin === 'search') sources.push('search_hit');
+  if (r.origin === 'probe')  sources.push('probe_hit');
+
+  return sources;
+}
+
 function mapRows(results) {
   return results.map(r => {
     const whoisOk = r.whois && r.whois.ok;
     const whoisLikely = whoisOk ? !!r.whois.likelyAvailable : false;
     const dnsResolves = r.dns && r.dns.resolves ? true : false;
     const crtCount = (r.crt && r.crt.ok && Array.isArray(r.crt.entries)) ? r.crt.entries.length : 0;
+
+    // available = TRUE hanya jika: whois likely free + DNS tidak resolve + crt_count=0
     const available = !!(whoisLikely && !dnsResolves && crtCount === 0);
+    const usageSources = computeUsageSources(r).join(';');
 
     return {
       query_name: r.query_name || '',
@@ -386,12 +453,13 @@ function mapRows(results) {
       match_score: r.match_score || 0,
       social_platform: r.social_platform || '',
       social_username: r.social_username || '',
+      usage_detected_from: usageSources,
       available: available
     };
   });
 }
 
-/* ---------- Excel helpers ---------- */
+/* ---------- Excel & CSV ---------- */
 const EXCEL_COLUMNS = [
   { header: 'query_name', key: 'query_name' },
   { header: 'domain', key: 'domain' },
@@ -407,6 +475,7 @@ const EXCEL_COLUMNS = [
   { header: 'match_score', key: 'match_score' },
   { header: 'social_platform', key: 'social_platform' },
   { header: 'social_username', key: 'social_username' },
+  { header: 'usage_detected_from', key: 'usage_detected_from' },
   { header: 'available', key: 'available' }
 ];
 
@@ -421,12 +490,8 @@ function autosizeColumns(worksheet, rows, min = 10, max = 80) {
     });
     col.width = Math.max(min, Math.min(max, longest + 2));
   });
-  // freeze first row and set autofilter
   worksheet.views = [{ state: 'frozen', ySplit: 1 }];
-  worksheet.autoFilter = {
-    from: { row: 1, column: 1 },
-    to: { row: 1, column: EXCEL_COLUMNS.length }
-  };
+  worksheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: EXCEL_COLUMNS.length } };
 }
 
 async function writePerNameXlsx(outdir, name, rows) {
@@ -461,6 +526,15 @@ async function writeSingleXlsx(outPath, rows) {
   return outPath;
 }
 
+// CSV fallback
+function csvEscape(v) { if (v == null) return ''; const s = String(v); return `"${s.replace(/"/g, '""')}"`; }
+function writeCsvFile(outPath, rows, headers) {
+  const headerLine = headers.map(h => csvEscape(h.header)).join(',');
+  const body = rows.map(r => headers.map(h => csvEscape(r[h.key])).join(',')).join('\n');
+  fs.writeFileSync(outPath, headerLine + '\n' + body);
+  return outPath;
+}
+
 /* ---------- CLI ---------- */
 async function main() {
   const argv = process.argv.slice(2);
@@ -480,7 +554,7 @@ async function main() {
   const limit = parseInt(flags.limit || '30', 10);
   const engine = flags.engine || 'auto'; // auto|serpapi|bing|ddg|multi
   const probe = flags.probe || 'auto';   // auto|always|off
-  const out = flags.out || null;         // if endsWith .xlsx => write excel
+  const out = flags.out || null;         // if .xlsx -> Excel
   const outdirXlsx = flags['outdir-xlsx'] || null;
   const combineXlsx = flags['combine-xlsx'] || null;
   const doWhois = !flags['no-whois'];
@@ -488,30 +562,33 @@ async function main() {
   const strict = !!flags['strict'];
   const allowMentions = !!flags['allow-mentions'];
   const debug = !!flags['debug'];
+  const onlyFound = !flags['show-candidates']; // default true
 
   let names = [];
   if (inputFile) {
-    if (!fs.existsSync(inputFile)) {
-      console.error(`Input file not found: ${inputFile}`); process.exit(1);
-    }
+    if (!fs.existsSync(inputFile)) { console.error(`Input file not found: ${inputFile}`); process.exit(1); }
     const content = fs.readFileSync(inputFile, 'utf8');
-    names = content.split(/\r?\n/).map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+    // baca mentah (pertahankan hyphen), strip komentar, trim
+    names = content
+      .split(/\r?\n/)
+      .map(s => s.trim())
+      .filter(s => s && !s.startsWith('#'));
     if (!names.length) { console.error('No valid names in input file.'); process.exit(1); }
   } else if (positionalName) {
     names = [positionalName];
   } else {
-    console.log('Usage:\n  node check_name_with_whois_crt.js "NameString" [--limit=30] [--engine=auto|serpapi|bing|ddg|multi] [--probe=auto|always|off] [--out=file.xlsx] [--no-whois] [--no-crt] [--strict] [--allow-mentions] [--debug]\n  node check_name_with_whois_crt.js --input=names.txt [--combine-xlsx=all.xlsx | --outdir-xlsx=out_xlsx] [same flags]');
+    console.log('Usage:\n  node check_name_with_whois_crt.js "NameString" [--limit=30] [--engine=auto|serpapi|bing|ddg|multi] [--probe=auto|always|off] [--out=file.xlsx] [--no-whois] [--no-crt] [--strict] [--allow-mentions] [--debug] [--show-candidates]\n  node check_name_with_whois_crt.js --input=names.txt [--combine-xlsx=all.xlsx | --outdir-xlsx=out_xlsx] [same flags]');
     process.exit(1);
   }
 
-  console.log(`Mode: ${inputFile ? 'BULK' : 'SINGLE'} | limit=${limit} | engine=${engine} | probe=${probe} | whois=${doWhois} | crt=${doCrt} | strict=${strict} | allowMentions=${allowMentions}`);
+  console.log(`Mode: ${inputFile ? 'BULK' : 'SINGLE'} | limit=${limit} | engine=${engine} | probe=${probe} | whois=${doWhois} | crt=${doCrt} | strict=${strict} | allowMentions=${allowMentions} | onlyFound=${onlyFound}`);
   if (inputFile) console.log(`Input file: ${inputFile}`);
 
   const allRowsForCombined = [];
   for (const name of names) {
     console.log(`\n>>> Checking: "${name}"`);
     try {
-      const res = await findNameUsage(name, { limit, doWhois, doCrt, strict, allowMentions, engine, debug, probe });
+      const res = await findNameUsage(name, { limit, doWhois, doCrt, strict, allowMentions, engine, debug, probe, onlyFound });
       res.results.forEach(r => r.query_name = name);
       const rows = mapRows(res.results);
 
@@ -520,12 +597,30 @@ async function main() {
       if (inputFile) {
         if (combineXlsx) allRowsForCombined.push(...rows);
         if (outdirXlsx) {
-          const p = await writePerNameXlsx(outdirXlsx, name, rows);
-          console.log(`Saved XLSX: ${p}`);
+          if (ExcelJS) {
+            const p = await writePerNameXlsx(outdirXlsx, name, rows);
+            console.log(`Saved XLSX: ${p}`);
+          } else {
+            ensureDir(outdirXlsx);
+            const csvOut = path.join(outdirXlsx, `${name.replace(/[^a-z0-9_-]+/gi,'_')}.csv`);
+            writeCsvFile(csvOut, rows, EXCEL_COLUMNS);
+            console.log(`exceljs tidak tersedia. Fallback ke CSV: ${csvOut}`);
+          }
         }
       } else if (out && out.toLowerCase().endsWith('.xlsx')) {
-        const p = await writeSingleXlsx(out, rows);
-        console.log(`Saved XLSX: ${p}`);
+        if (ExcelJS) {
+          const p = await writeSingleXlsx(out, rows);
+          console.log(`Saved XLSX: ${p}`);
+        } else {
+          const csvOut = out.replace(/\.xlsx$/i, '.csv');
+          writeCsvFile(csvOut, rows, EXCEL_COLUMNS);
+          console.log(`exceljs tidak tersedia. Fallback ke CSV: ${csvOut}`);
+        }
+      } else if (!inputFile && !out) {
+        // kalau user tidak set --out di mode SINGLE, tetap cetak CSV ke stdout-friendly file
+        const csvOut = `${name.replace(/[^a-z0-9_-]+/gi,'_')}.csv`;
+        writeCsvFile(csvOut, rows, EXCEL_COLUMNS);
+        console.log(`No --out given. Saved CSV: ${csvOut}`);
       }
     } catch (e) {
       console.error(`Error on "${name}":`, e.message);
@@ -533,8 +628,14 @@ async function main() {
   }
 
   if (inputFile && combineXlsx) {
-    const p = await writeCombinedXlsx(combineXlsx, allRowsForCombined);
-    console.log(`\nSaved combined XLSX: ${p}  (total rows: ${allRowsForCombined.length})`);
+    if (ExcelJS) {
+      const p = await writeCombinedXlsx(combineXlsx, allRowsForCombined);
+      console.log(`\nSaved combined XLSX: ${p}  (total rows: ${allRowsForCombined.length})`);
+    } else {
+      const csvOut = combineXlsx.replace(/\.xlsx$/i, '.csv');
+      writeCsvFile(csvOut, allRowsForCombined, EXCEL_COLUMNS);
+      console.log(`\nexceljs tidak tersedia. Fallback ke CSV: ${csvOut}  (total rows: ${allRowsForCombined.length})`);
+    }
   }
 }
 
