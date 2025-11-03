@@ -136,8 +136,9 @@ async function checkInstagram(username) {
 
 /**
  * Check Facebook page/profile
- * Facebook redirects to web.facebook.com for existing pages
- * Example: facebook.com/cretivox -> web.facebook.com/cretivox?_rdc=1&_rdr
+ * Facebook embeds user data in response body
+ * EXISTS: Multiple "userID" fields (9+) with actual ID like "100051375944041"
+ * NOT EXISTS: Only 1 "userID" field with value "0"
  */
 async function checkFacebook(username) {
   const cleanUsername = username.replace(/^@/, '');
@@ -146,18 +147,94 @@ async function checkFacebook(username) {
   try {
     const response = await fetchWithHeaders(url, { timeout: 20000 });
 
-    // Successful page load = taken
-    if (response.status === 200) {
-      return { exists: true, url, status: 'taken', confidence: 'high' };
+    // Get response body to check userID pattern
+    let html = '';
+    try {
+      html = await response.text();
+    } catch (e) {
+      // If we can't get body, fall back to status code check
+      if (response.status === 200) {
+        return { exists: true, url, status: 'taken', confidence: 'medium', note: 'Status 200 (body unreadable)' };
+      }
+      if (response.status === 404) {
+        return { exists: false, url, status: 'available', confidence: 'high' };
+      }
     }
+
+    // Check userID pattern in response
+    if (html) {
+      // Count occurrences of "userID"
+      const userIDMatches = html.match(/"userID"\s*:\s*"([^"]+)"/g) || [];
+      const userIDCount = userIDMatches.length;
+
+      // Extract userID values
+      const userIDValues = userIDMatches.map(match => {
+        const valueMatch = match.match(/"userID"\s*:\s*"([^"]+)"/);
+        return valueMatch ? valueMatch[1] : null;
+      }).filter(Boolean);
+
+      // Check for userVanity (stronger indicator)
+      const hasUserVanity = html.includes(`"userVanity":"${cleanUsername}"`);
+
+      // Profile EXISTS if:
+      // 1. Multiple userID fields (9+)
+      // 2. userID values are not "0"
+      // 3. Or has userVanity matching username
+      const hasRealUserID = userIDValues.some(id => id !== "0" && id.length > 1);
+
+      if (userIDCount >= 3 && hasRealUserID) {
+        return {
+          exists: true,
+          url,
+          status: 'taken',
+          confidence: 'high',
+          note: `Found ${userIDCount} userID fields with real IDs`
+        };
+      }
+
+      if (hasUserVanity) {
+        return {
+          exists: true,
+          url,
+          status: 'taken',
+          confidence: 'high',
+          note: 'Found userVanity matching username'
+        };
+      }
+
+      // Profile DOESN'T EXIST if:
+      // Only 1 userID field with value "0"
+      if (userIDCount <= 1 && userIDValues.every(id => id === "0")) {
+        return {
+          exists: false,
+          url,
+          status: 'available',
+          confidence: 'high',
+          note: 'Only found userID: "0" (no profile)'
+        };
+      }
+
+      // Check for "Page Not Found" text
+      if (html.includes('Page Not Found') ||
+          html.includes('This content isn\'t available') ||
+          html.includes('Content Not Available')) {
+        return { exists: false, url, status: 'available', confidence: 'high' };
+      }
+    }
+
+    // Fallback to HTTP status code checks
 
     // 404 = definitely doesn't exist
     if (response.status === 404) {
       return { exists: false, url, status: 'available', confidence: 'high' };
     }
 
-    // Redirect = page exists
-    // Facebook typically redirects to web.facebook.com, m.facebook.com, or with query params
+    // 200 = likely exists (but couldn't parse body reliably)
+    if (response.status === 200) {
+      return { exists: true, url, status: 'taken', confidence: 'medium', note: 'Status 200 but could not verify userID pattern' };
+    }
+
+    // Redirect = page likely exists
     if (response.isRedirect || response.status === 302 || response.status === 301) {
       const redirUrl = response.redirectUrl || '';
       // Check if redirect is to Facebook domain (not error page)
@@ -177,8 +254,13 @@ async function checkFacebook(username) {
       return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Network error - check manually' };
     }
 
+    // 403 = Blocked
+    if (response.status === 403) {
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Blocked by Facebook - check manually' };
+    }
+
     // Other status codes
-    return { exists: null, url, status: 'unknown', confidence: 'medium', note: `HTTP ${response.status}` };
+    return { exists: null, url, status: 'unknown', confidence: 'medium', note: `HTTP ${response.status} - check manually` };
 
   } catch (error) {
     return { exists: null, url, status: 'unknown', confidence: 'none', error: error.message };
