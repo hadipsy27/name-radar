@@ -136,57 +136,46 @@ async function fetchWithHeaders(url, options = {}) {
 
 /**
  * Check Instagram account
- * Strategy 1: Search-based detection (Primary - avoids anti-bot)
- * Strategy 2: Direct probe (Fallback)
- *
- * SEARCH APPROACH:
- * - Search "instagram {username}" on Bing/Google
- * - If results contain instagram.com/{username}/ → account EXISTS
- * - Avoids Instagram's aggressive anti-bot measures
+ * Conservative detection: verify response body for 200 status
+ * Philosophy: Better to say "unknown" than incorrectly say "taken"
  */
 async function checkInstagram(username) {
   const cleanUsername = username.replace(/^@/, '');
   const url = `https://www.instagram.com/${cleanUsername}/`;
 
   try {
-    // STRATEGY 1: Search-based detection
-    const searchQuery = `instagram ${cleanUsername}`;
-    const searchResults = await searchEngine(searchQuery, 10);
-
-    // Look for Instagram URLs matching this username
-    const igUrlPatterns = [
-      `instagram.com/${cleanUsername}`,
-      `instagram.com/${cleanUsername}/`,
-      `www.instagram.com/${cleanUsername}`,
-      `www.instagram.com/${cleanUsername}/`
-    ];
-
-    const foundInSearch = searchResults.some(resultUrl => {
-      const lowerUrl = resultUrl.toLowerCase();
-      return igUrlPatterns.some(pattern => lowerUrl.includes(pattern));
-    });
-
-    if (foundInSearch) {
-      return {
-        exists: true,
-        url,
-        status: 'taken',
-        confidence: 'high',
-        note: 'Found in search results (Google/Bing)'
-      };
-    }
-
-    // STRATEGY 2: Direct probe (fallback)
     const response = await fetchWithHeaders(url, { timeout: 20000 });
 
-    // 404 = account doesn't exist
+    // 404 = account doesn't exist (RELIABLE)
     if (response.status === 404) {
       return { exists: false, url, status: 'available', confidence: 'high' };
     }
 
-    // 200 = account exists
+    // 200 = might exist, need to verify response body
     if (response.status === 200) {
-      return { exists: true, url, status: 'taken', confidence: 'high' };
+      try {
+        const html = await response.text();
+
+        // Check for "Page Not Found" or similar messages in body
+        if (html.includes('Sorry, this page isn\'t available') ||
+            html.includes('The link you followed may be broken') ||
+            html.includes('Page Not Found')) {
+          return { exists: false, url, status: 'available', confidence: 'high', note: 'Page not found (verified)' };
+        }
+
+        // Check for profile indicators in body
+        if (html.includes('"username":"' + cleanUsername + '"') ||
+            html.includes('profilePage') ||
+            html.includes('ProfilePage')) {
+          return { exists: true, url, status: 'taken', confidence: 'high', note: 'Profile verified' };
+        }
+
+        // Got 200 but can't verify - be conservative
+        return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not verify - check manually' };
+      } catch (e) {
+        // Can't read body - be conservative
+        return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not verify response - check manually' };
+      }
     }
 
     // 429 = rate limited (can't determine)
@@ -194,34 +183,14 @@ async function checkInstagram(username) {
       return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Rate limited - check manually' };
     }
 
-    // Redirect = likely exists (Instagram redirects to login or mobile version)
-    if (response.isRedirect || response.status === 302 || response.status === 301) {
-      const redirUrl = response.redirectUrl || '';
-      // If redirecting within Instagram domain (not to login or error), account exists
-      if (redirUrl.includes('instagram.com') && !redirUrl.includes('/accounts/login')) {
-        return {
-          exists: true,
-          url,
-          status: 'taken',
-          confidence: 'high',
-          note: 'Redirected (account exists)'
-        };
-      }
-      // Redirect to login might mean account exists but requires auth
-      if (redirUrl.includes('/accounts/login')) {
-        return {
-          exists: null,
-          url,
-          status: 'unknown',
-          confidence: 'none',
-          note: 'Requires login - check manually'
-        };
-      }
-    }
-
     // 403 = Forbidden (Instagram blocking, can't determine)
     if (response.status === 403) {
       return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Blocked by Instagram - check manually' };
+    }
+
+    // Redirect = uncertain without following
+    if (response.isRedirect || response.status === 302 || response.status === 301) {
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Redirect detected - check manually' };
     }
 
     // 0 = network error, timeout, etc - can't determine
@@ -229,8 +198,8 @@ async function checkInstagram(username) {
       return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Network error - check manually' };
     }
 
-    // Other status codes
-    return { exists: null, url, status: 'unknown', confidence: 'low', note: `HTTP ${response.status} - check manually` };
+    // Other status codes - be conservative
+    return { exists: null, url, status: 'unknown', confidence: 'none', note: `HTTP ${response.status} - check manually` };
 
   } catch (error) {
     return { exists: null, url, status: 'unknown', confidence: 'none', error: error.message };
@@ -239,70 +208,33 @@ async function checkInstagram(username) {
 
 /**
  * Check Facebook page/profile
- * Strategy 1: Search Google/Bing for "facebook {username}" to avoid anti-bot blocking
- * Strategy 2: Direct probe with userID pattern detection (fallback)
- *
- * SEARCH APPROACH (Primary):
- * - Search "facebook {username}" on Bing/Google
- * - If results contain https://www.facebook.com/{username}/ → profile EXISTS
- * - Avoids Facebook's anti-bot measures
- *
- * DIRECT PROBE (Fallback):
- * - EXISTS: Multiple "userID" fields (9+) with actual ID like "100051375944041"
+ * Uses userID pattern detection (discovered by user)
+ * - EXISTS: Multiple "userID" fields (3+) with actual ID like "100051375944041"
  * - NOT EXISTS: Only 1 "userID" field with value "0"
+ * Conservative: defaults to "unknown" when can't verify
  */
 async function checkFacebook(username) {
   const cleanUsername = username.replace(/^@/, '');
   const url = `https://www.facebook.com/${cleanUsername}`;
 
   try {
-    // STRATEGY 1: Search-based detection (Google/Bing search approach)
-    // Search for "facebook {username}" and check if Facebook URL appears in results
-    const searchQuery = `facebook ${cleanUsername}`;
-    const searchResults = await searchEngine(searchQuery, 10);
-
-    // Look for Facebook URLs matching this username
-    const fbUrlPatterns = [
-      `facebook.com/${cleanUsername}`,
-      `facebook.com/${cleanUsername}/`,
-      `www.facebook.com/${cleanUsername}`,
-      `www.facebook.com/${cleanUsername}/`,
-      `web.facebook.com/${cleanUsername}`,
-      `m.facebook.com/${cleanUsername}`
-    ];
-
-    const foundInSearch = searchResults.some(resultUrl => {
-      const lowerUrl = resultUrl.toLowerCase();
-      return fbUrlPatterns.some(pattern => lowerUrl.includes(pattern));
-    });
-
-    if (foundInSearch) {
-      return {
-        exists: true,
-        url,
-        status: 'taken',
-        confidence: 'high',
-        note: 'Found in search results (Google/Bing)'
-      };
-    }
-
-    // If search returns no results OR no Facebook URL found, try direct probe
-    // STRATEGY 2: Direct probe with userID pattern detection (fallback)
-
     const response = await fetchWithHeaders(url, { timeout: 20000 });
+
+    // 404 = definitely doesn't exist
+    if (response.status === 404) {
+      return { exists: false, url, status: 'available', confidence: 'high' };
+    }
 
     // Get response body to check userID pattern
     let html = '';
     try {
       html = await response.text();
     } catch (e) {
-      // If we can't get body, fall back to status code check
+      // Can't get body - be conservative
       if (response.status === 200) {
-        return { exists: true, url, status: 'taken', confidence: 'medium', note: 'Status 200 (body unreadable)' };
+        return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not verify response - check manually' };
       }
-      if (response.status === 404) {
-        return { exists: false, url, status: 'available', confidence: 'high' };
-      }
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not read response - check manually' };
     }
 
     // Check userID pattern in response
@@ -321,9 +253,8 @@ async function checkFacebook(username) {
       const hasUserVanity = html.includes(`"userVanity":"${cleanUsername}"`);
 
       // Profile EXISTS if:
-      // 1. Multiple userID fields (9+)
-      // 2. userID values are not "0"
-      // 3. Or has userVanity matching username
+      // 1. Multiple userID fields (3+) with real IDs (not "0")
+      // 2. Or has userVanity matching username
       const hasRealUserID = userIDValues.some(id => id !== "0" && id.length > 1);
 
       if (userIDCount >= 3 && hasRealUserID) {
@@ -364,38 +295,17 @@ async function checkFacebook(username) {
           html.includes('Content Not Available')) {
         return { exists: false, url, status: 'available', confidence: 'high' };
       }
-    }
 
-    // Fallback to HTTP status code checks
-
-    // 404 = definitely doesn't exist
-    if (response.status === 404) {
-      return { exists: false, url, status: 'available', confidence: 'high' };
-    }
-
-    // 200 = likely exists (but couldn't parse body reliably)
-    if (response.status === 200) {
-      return { exists: true, url, status: 'taken', confidence: 'medium', note: 'Status 200 but could not verify userID pattern' };
-    }
-
-    // Redirect = page likely exists
-    if (response.isRedirect || response.status === 302 || response.status === 301) {
-      const redirUrl = response.redirectUrl || '';
-      // Check if redirect is to Facebook domain (not error page)
-      if (redirUrl.includes('facebook.com') && !redirUrl.includes('login') && !redirUrl.includes('error')) {
-        return {
-          exists: true,
-          url: redirUrl || url,
-          status: 'taken',
-          confidence: 'high',
-          note: 'Redirected (page exists)'
-        };
+      // Check for "Sorry, this page isn't available" (mobile version)
+      if (html.includes('Sorry, this page isn\'t available') ||
+          html.includes('The link may be broken')) {
+        return { exists: false, url, status: 'available', confidence: 'high' };
       }
     }
 
-    // Network error
-    if (response.status === 0) {
-      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Network error - check manually' };
+    // 200 but couldn't parse userID pattern - be conservative
+    if (response.status === 200) {
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not verify userID pattern - check manually' };
     }
 
     // 403 = Blocked
@@ -403,8 +313,18 @@ async function checkFacebook(username) {
       return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Blocked by Facebook - check manually' };
     }
 
-    // Other status codes
-    return { exists: null, url, status: 'unknown', confidence: 'medium', note: `HTTP ${response.status} - check manually` };
+    // Redirect = uncertain
+    if (response.isRedirect || response.status === 302 || response.status === 301) {
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Redirect detected - check manually' };
+    }
+
+    // Network error
+    if (response.status === 0) {
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Network error - check manually' };
+    }
+
+    // Other status codes - be conservative
+    return { exists: null, url, status: 'unknown', confidence: 'none', note: `HTTP ${response.status} - check manually` };
 
   } catch (error) {
     return { exists: null, url, status: 'unknown', confidence: 'none', error: error.message };
@@ -413,40 +333,55 @@ async function checkFacebook(username) {
 
 /**
  * Check YouTube channel
- * YouTube returns 200 for existing channels, 404 for non-existent
- * May redirect to different YouTube URL formats
+ * Conservative detection: verify response body for 200 status
  */
 async function checkYouTube(username) {
   const cleanUsername = username.replace(/^@/, '');
-
-  // Try @username format (new format)
   const url = `https://www.youtube.com/@${cleanUsername}`;
 
   try {
     const response = await fetchWithHeaders(url, { timeout: 20000 });
 
-    // 200 = channel exists
-    if (response.status === 200) {
-      return { exists: true, url, status: 'taken', confidence: 'high' };
-    }
-
-    // 404 = channel doesn't exist
+    // 404 = channel doesn't exist (RELIABLE)
     if (response.status === 404) {
       return { exists: false, url, status: 'available', confidence: 'high' };
     }
 
-    // Redirect = channel exists (YouTube may redirect to /c/ or /channel/ format)
-    if (response.isRedirect || response.status === 302 || response.status === 301) {
-      const redirUrl = response.redirectUrl || '';
-      if (redirUrl.includes('youtube.com') && !redirUrl.includes('error')) {
-        return {
-          exists: true,
-          url: redirUrl || url,
-          status: 'taken',
-          confidence: 'high',
-          note: 'Redirected (channel exists)'
-        };
+    // 200 = might exist, verify body
+    if (response.status === 200) {
+      try {
+        const html = await response.text();
+
+        // Check for "This channel doesn't exist" or similar
+        if (html.includes('This channel doesn\'t exist') ||
+            html.includes('This page isn\'t available') ||
+            html.includes('Channel not found')) {
+          return { exists: false, url, status: 'available', confidence: 'high', note: 'Channel not found (verified)' };
+        }
+
+        // Check for channel indicators
+        if (html.includes('"channelId"') ||
+            html.includes('"author":"' + cleanUsername + '"') ||
+            html.includes('ytInitialData')) {
+          return { exists: true, url, status: 'taken', confidence: 'high', note: 'Channel verified' };
+        }
+
+        // Got 200 but can't verify - be conservative
+        return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not verify - check manually' };
+      } catch (e) {
+        // Can't read body - be conservative
+        return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not verify response - check manually' };
       }
+    }
+
+    // 403 = blocked
+    if (response.status === 403) {
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Blocked by YouTube - check manually' };
+    }
+
+    // Redirect = uncertain
+    if (response.isRedirect || response.status === 302 || response.status === 301) {
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Redirect detected - check manually' };
     }
 
     // Network error
@@ -454,7 +389,8 @@ async function checkYouTube(username) {
       return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Network error - check manually' };
     }
 
-    return { exists: null, url, status: 'unknown', confidence: 'medium', note: `HTTP ${response.status}` };
+    // Other status codes - be conservative
+    return { exists: null, url, status: 'unknown', confidence: 'none', note: `HTTP ${response.status} - check manually` };
 
   } catch (error) {
     return { exists: null, url, status: 'unknown', confidence: 'none', error: error.message };
@@ -463,84 +399,83 @@ async function checkYouTube(username) {
 
 /**
  * Check Twitter/X account
- * Strategy 1: Search-based detection (Primary)
- * Strategy 2: Direct probe (Fallback)
- *
- * SEARCH APPROACH:
- * - Search "twitter {username}" or "x {username}" on Bing/Google
- * - If results contain twitter.com/{username} or x.com/{username} → account EXISTS
+ * Conservative detection: verify response body for 200 status
+ * Tries both twitter.com and x.com (Twitter redirects to x.com)
  */
 async function checkTwitter(username) {
   const cleanUsername = username.replace(/^@/, '');
 
   try {
-    // STRATEGY 1: Search-based detection
-    const searchQuery = `twitter ${cleanUsername}`;
-    const searchResults = await searchEngine(searchQuery, 10);
-
-    // Look for Twitter/X URLs matching this username
-    const twitterUrlPatterns = [
-      `twitter.com/${cleanUsername}`,
-      `www.twitter.com/${cleanUsername}`,
-      `x.com/${cleanUsername}`,
-      `www.x.com/${cleanUsername}`
-    ];
-
-    const foundInSearch = searchResults.some(resultUrl => {
-      const lowerUrl = resultUrl.toLowerCase();
-      return twitterUrlPatterns.some(pattern => lowerUrl.includes(pattern));
-    });
-
-    if (foundInSearch) {
-      return {
-        exists: true,
-        url: `https://twitter.com/${cleanUsername}`,
-        status: 'taken',
-        confidence: 'high',
-        note: 'Found in search results (Google/Bing)'
-      };
-    }
-
-    // STRATEGY 2: Direct probe (fallback)
     // Try both twitter.com and x.com
     const urls = [
       `https://twitter.com/${cleanUsername}`,
       `https://x.com/${cleanUsername}`
     ];
 
+    let last404Count = 0;
+
     for (const url of urls) {
       try {
         const response = await fetchWithHeaders(url, { timeout: 20000 });
 
-        // Successful page load = taken
-        if (response.status === 200) {
-          return { exists: true, url, status: 'taken', confidence: 'high' };
-        }
-
-        // 404 = doesn't exist
+        // 404 = doesn't exist on this domain
         if (response.status === 404) {
+          last404Count++;
           // Only return available if BOTH URLs return 404
-          if (url === urls[urls.length - 1]) {
+          if (last404Count >= 2) {
             return { exists: false, url: urls[0], status: 'available', confidence: 'high' };
           }
           continue; // Try next URL
         }
 
-        // Redirect = account exists
-        // Twitter redirects from twitter.com to x.com
+        // 200 = might exist, verify body
+        if (response.status === 200) {
+          try {
+            const html = await response.text();
+
+            // Check for "Account suspended" or "This account doesn't exist"
+            if (html.includes('Account suspended') ||
+                html.includes('This account doesn\'t exist') ||
+                html.includes('User not found')) {
+              last404Count++;
+              if (last404Count >= 2) {
+                return { exists: false, url: urls[0], status: 'available', confidence: 'high', note: 'Account not found (verified)' };
+              }
+              continue;
+            }
+
+            // Check for profile indicators
+            if (html.includes('"screen_name":"' + cleanUsername + '"') ||
+                html.includes('ProfilePage') ||
+                html.includes('UserProfileHeader')) {
+              return { exists: true, url, status: 'taken', confidence: 'high', note: 'Profile verified' };
+            }
+
+            // Got 200 but can't verify - be conservative
+            return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not verify - check manually' };
+          } catch (e) {
+            // Can't read body - be conservative
+            return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not verify response - check manually' };
+          }
+        }
+
+        // Redirect - might be account exists (twitter.com → x.com)
         if (response.isRedirect || response.status === 302 || response.status === 301) {
           const redirUrl = response.redirectUrl || '';
-          // Check if redirect is to x.com or twitter.com domain (not error page)
-          if ((redirUrl.includes('x.com') || redirUrl.includes('twitter.com')) &&
+          // Only trust redirect if it goes to x.com or twitter.com with same username
+          if ((redirUrl.includes(`x.com/${cleanUsername}`) || redirUrl.includes(`twitter.com/${cleanUsername}`)) &&
               !redirUrl.includes('login') && !redirUrl.includes('error')) {
-            return {
-              exists: true,
-              url: redirUrl || url,
-              status: 'taken',
-              confidence: 'high',
-              note: 'Redirected (account exists)'
-            };
+            // Don't immediately say taken - this could be a redirect loop
+            // Continue to next URL to verify
+            continue;
           }
+          // Other redirects are uncertain
+          return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Redirect detected - check manually' };
+        }
+
+        // 403 = blocked
+        if (response.status === 403) {
+          return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Blocked by platform - check manually' };
         }
 
         // Network error
@@ -554,7 +489,7 @@ async function checkTwitter(username) {
         }
 
         // Last URL - return unknown
-        return { exists: null, url: urls[0], status: 'unknown', confidence: 'medium', note: `HTTP ${response.status}` };
+        return { exists: null, url: urls[0], status: 'unknown', confidence: 'none', note: `HTTP ${response.status} - check manually` };
 
       } catch (error) {
         if (url === urls[urls.length - 1]) {
@@ -564,7 +499,7 @@ async function checkTwitter(username) {
       }
     }
 
-    return { exists: null, url: urls[0], status: 'unknown', confidence: 'none', note: 'All attempts failed' };
+    return { exists: null, url: urls[0], status: 'unknown', confidence: 'none', note: 'Could not verify - check manually' };
 
   } catch (error) {
     return { exists: null, url: `https://twitter.com/${cleanUsername}`, status: 'unknown', confidence: 'none', error: error.message };
@@ -573,8 +508,8 @@ async function checkTwitter(username) {
 
 /**
  * Check TikTok account
- * TikTok returns 200 for existing accounts
- * May have aggressive anti-bot protection
+ * Conservative detection: verify response body for 200 status
+ * TikTok has aggressive anti-bot protection
  */
 async function checkTikTok(username) {
   const cleanUsername = username.replace(/^@/, '');
@@ -583,33 +518,46 @@ async function checkTikTok(username) {
   try {
     const response = await fetchWithHeaders(url, { timeout: 20000 });
 
-    // 200 = account exists
-    if (response.status === 200) {
-      return { exists: true, url, status: 'taken', confidence: 'high' };
-    }
-
-    // 404 = account doesn't exist
+    // 404 = account doesn't exist (RELIABLE)
     if (response.status === 404) {
       return { exists: false, url, status: 'available', confidence: 'high' };
     }
 
-    // Redirect = account likely exists
-    if (response.isRedirect || response.status === 302 || response.status === 301) {
-      const redirUrl = response.redirectUrl || '';
-      if (redirUrl.includes('tiktok.com') && !redirUrl.includes('error')) {
-        return {
-          exists: true,
-          url: redirUrl || url,
-          status: 'taken',
-          confidence: 'high',
-          note: 'Redirected (account exists)'
-        };
+    // 200 = might exist, verify body
+    if (response.status === 200) {
+      try {
+        const html = await response.text();
+
+        // Check for "Couldn't find this account" or similar
+        if (html.includes('Couldn\'t find this account') ||
+            html.includes('User not found') ||
+            html.includes('This account cannot be found')) {
+          return { exists: false, url, status: 'available', confidence: 'high', note: 'Account not found (verified)' };
+        }
+
+        // Check for profile indicators
+        if (html.includes('"uniqueId":"' + cleanUsername + '"') ||
+            html.includes('"@' + cleanUsername + '"') ||
+            html.includes('UserPage')) {
+          return { exists: true, url, status: 'taken', confidence: 'high', note: 'Profile verified' };
+        }
+
+        // Got 200 but can't verify - be conservative
+        return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not verify - check manually' };
+      } catch (e) {
+        // Can't read body - be conservative
+        return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not verify response - check manually' };
       }
     }
 
-    // 403 = Blocked by TikTok
+    // 403 = Blocked by TikTok (common with anti-bot)
     if (response.status === 403) {
       return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Blocked by TikTok - check manually' };
+    }
+
+    // Redirect = uncertain
+    if (response.isRedirect || response.status === 302 || response.status === 301) {
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Redirect detected - check manually' };
     }
 
     // Network error
@@ -617,7 +565,8 @@ async function checkTikTok(username) {
       return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Network error - check manually' };
     }
 
-    return { exists: null, url, status: 'unknown', confidence: 'medium', note: `HTTP ${response.status} - check manually` };
+    // Other status codes - be conservative
+    return { exists: null, url, status: 'unknown', confidence: 'none', note: `HTTP ${response.status} - check manually` };
 
   } catch (error) {
     return { exists: null, url, status: 'unknown', confidence: 'none', error: error.message };
@@ -626,8 +575,7 @@ async function checkTikTok(username) {
 
 /**
  * Check LinkedIn company/profile
- * LinkedIn returns 200 for existing pages
- * May redirect to different URL or require authentication
+ * Conservative detection: LinkedIn often requires auth, so be careful
  */
 async function checkLinkedIn(username) {
   const cleanUsername = username.replace(/^@/, '');
@@ -637,45 +585,51 @@ async function checkLinkedIn(username) {
   try {
     const response = await fetchWithHeaders(url, { timeout: 20000 });
 
-    // 200 = page exists
-    if (response.status === 200) {
-      return { exists: true, url, status: 'taken', confidence: 'high' };
-    }
-
-    // 404 = page doesn't exist
+    // 404 = page doesn't exist (RELIABLE)
     if (response.status === 404) {
-      return { exists: false, url, status: 'available', confidence: 'medium' };
+      return { exists: false, url, status: 'available', confidence: 'high' };
     }
 
-    // Redirect = page likely exists
-    if (response.isRedirect || response.status === 302 || response.status === 301) {
-      const redirUrl = response.redirectUrl || '';
-      // LinkedIn may redirect to login or different format
-      if (redirUrl.includes('linkedin.com')) {
-        // If redirecting to login/auth, can't determine - needs manual check
-        if (redirUrl.includes('authwall') || redirUrl.includes('login')) {
-          return {
-            exists: null,
-            url,
-            status: 'unknown',
-            confidence: 'none',
-            note: 'Requires login - check manually'
-          };
+    // 200 = might exist, verify body
+    if (response.status === 200) {
+      try {
+        const html = await response.text();
+
+        // Check for "Page not found" or similar
+        if (html.includes('Page not found') ||
+            html.includes('This page doesn\'t exist') ||
+            html.includes('Company not found')) {
+          return { exists: false, url, status: 'available', confidence: 'high', note: 'Page not found (verified)' };
         }
-        // Other LinkedIn redirects usually mean page exists
-        return {
-          exists: true,
-          url: redirUrl || url,
-          status: 'taken',
-          confidence: 'high',
-          note: 'Redirected (page exists)'
-        };
+
+        // Check for company/profile indicators
+        if (html.includes('"companyPageUrl"') ||
+            html.includes('"organizationId"') ||
+            html.includes('companyInfo')) {
+          return { exists: true, url, status: 'taken', confidence: 'high', note: 'Company page verified' };
+        }
+
+        // Got 200 but can't verify - be conservative
+        return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not verify - check manually' };
+      } catch (e) {
+        // Can't read body - be conservative
+        return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Could not verify response - check manually' };
       }
     }
 
-    // 999 = LinkedIn rate limiting
+    // 999 = LinkedIn rate limiting (very common)
     if (response.status === 999) {
       return { exists: null, url, status: 'unknown', confidence: 'none', note: 'LinkedIn rate limit - check manually' };
+    }
+
+    // 403 = blocked
+    if (response.status === 403) {
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Blocked by LinkedIn - check manually' };
+    }
+
+    // Redirect = uncertain (LinkedIn often redirects to login)
+    if (response.isRedirect || response.status === 302 || response.status === 301) {
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Redirect/requires login - check manually' };
     }
 
     // Network error
@@ -683,7 +637,8 @@ async function checkLinkedIn(username) {
       return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Network error - check manually' };
     }
 
-    return { exists: null, url, status: 'unknown', confidence: 'medium', note: `HTTP ${response.status} - check manually` };
+    // Other status codes - be conservative
+    return { exists: null, url, status: 'unknown', confidence: 'none', note: `HTTP ${response.status} - check manually` };
 
   } catch (error) {
     return { exists: null, url, status: 'unknown', confidence: 'none', error: error.message };
@@ -693,6 +648,7 @@ async function checkLinkedIn(username) {
 /**
  * Check GitHub account
  * GitHub is the most reliable - returns 404 for non-existent users/orgs
+ * Very trustworthy for 200 and 404 status codes
  */
 async function checkGitHub(username) {
   const cleanUsername = username.replace(/^@/, '');
@@ -706,22 +662,28 @@ async function checkGitHub(username) {
       return { exists: false, url, status: 'available', confidence: 'high' };
     }
 
-    // 200 = user/org exists
+    // 200 = user/org exists (GitHub is very reliable with this)
     if (response.status === 200) {
-      return { exists: true, url, status: 'taken', confidence: 'high' };
-    }
+      try {
+        const html = await response.text();
 
-    // Redirect = user/org exists (rare but possible)
-    if (response.isRedirect || response.status === 302 || response.status === 301) {
-      const redirUrl = response.redirectUrl || '';
-      if (redirUrl.includes('github.com')) {
-        return {
-          exists: true,
-          url: redirUrl || url,
-          status: 'taken',
-          confidence: 'high',
-          note: 'Redirected (account exists)'
-        };
+        // Verify it's actually a profile page
+        if (html.includes('Not Found') || html.includes('404')) {
+          return { exists: false, url, status: 'available', confidence: 'high', note: 'Page not found (verified)' };
+        }
+
+        // Check for profile indicators
+        if (html.includes('"login":"' + cleanUsername + '"') ||
+            html.includes('profileName') ||
+            html.includes('user-profile')) {
+          return { exists: true, url, status: 'taken', confidence: 'high', note: 'Profile verified' };
+        }
+
+        // GitHub 200 is usually reliable even without body parsing
+        return { exists: true, url, status: 'taken', confidence: 'high' };
+      } catch (e) {
+        // Even if we can't read body, GitHub 200 is very reliable
+        return { exists: true, url, status: 'taken', confidence: 'high' };
       }
     }
 
@@ -730,12 +692,23 @@ async function checkGitHub(username) {
       return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Rate limited - check manually' };
     }
 
+    // 403 = blocked
+    if (response.status === 403) {
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Blocked by GitHub - check manually' };
+    }
+
+    // Redirect = uncertain (rare on GitHub)
+    if (response.isRedirect || response.status === 302 || response.status === 301) {
+      return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Redirect detected - check manually' };
+    }
+
     // Network error
     if (response.status === 0) {
       return { exists: null, url, status: 'unknown', confidence: 'none', note: 'Network error - check manually' };
     }
 
-    return { exists: null, url, status: 'unknown', confidence: 'medium', note: `HTTP ${response.status} - check manually` };
+    // Other status codes - be conservative
+    return { exists: null, url, status: 'unknown', confidence: 'none', note: `HTTP ${response.status} - check manually` };
 
   } catch (error) {
     return { exists: null, url, status: 'unknown', confidence: 'none', error: error.message };
