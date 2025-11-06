@@ -95,11 +95,18 @@ function calculateDomainScore(results) {
   // Check critical TLDs
   const criticalTLDs = ['com', 'co.id', 'id', 'io'];
   const availableCritical = criticalTLDs.filter(tld => {
-    const found = domainResults.find(r =>
-      r.domain && r.domain.endsWith(`.${tld}`) &&
-      (!r.whois || (r.whois.likelyAvailable))
-    );
-    return !found;
+    const found = domainResults.find(r => {
+      if (!r.domain || !r.domain.endsWith(`.${tld}`)) return false;
+
+      // Check if domain is taken (any evidence)
+      const dnsTaken = r.dns && r.dns.resolves;
+      const crtTaken = r.crt && r.crt.ok && r.crt.entries && r.crt.entries.length > 0;
+      const whoisTaken = r.whois && r.whois.ok && !r.whois.likelyAvailable;
+
+      return dnsTaken || crtTaken || whoisTaken;
+    });
+
+    return !found; // Available if NOT found as taken
   });
 
   score.details.criticalTLDs = {
