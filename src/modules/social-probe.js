@@ -136,14 +136,55 @@ async function fetchWithHeaders(url, options = {}) {
 
 /**
  * Check Instagram account
- * Conservative detection: verify response body for 200 status
- * Philosophy: Better to say "unknown" than incorrectly say "taken"
+ * Pattern discovered by user:
+ * - EXISTS: Response has "params": { "username": "vanillamale" }
+ * - DOESN'T EXIST: Response has "params": {} (empty)
+ * Strategy 1: Google search verification (Primary)
+ * Strategy 2: Direct probe with params check (Fallback)
  */
 async function checkInstagram(username) {
   const cleanUsername = username.replace(/^@/, '');
   const url = `https://www.instagram.com/${cleanUsername}/`;
 
   try {
+    // STRATEGY 1: Google search verification
+    // Search "instagram :username" and check if top result is instagram.com/username
+    try {
+      const searchQuery = `instagram ${cleanUsername}`;
+      const searchResults = await searchEngine(searchQuery, 5);
+
+      // Check if any result is the exact Instagram profile URL
+      const exactMatch = searchResults.some(resultUrl => {
+        const lowerUrl = resultUrl.toLowerCase();
+        return lowerUrl === `https://www.instagram.com/${cleanUsername.toLowerCase()}/` ||
+               lowerUrl === `https://www.instagram.com/${cleanUsername.toLowerCase()}` ||
+               lowerUrl === `https://instagram.com/${cleanUsername.toLowerCase()}/` ||
+               lowerUrl === `https://instagram.com/${cleanUsername.toLowerCase()}`;
+      });
+
+      if (exactMatch) {
+        return {
+          exists: true,
+          url,
+          status: 'taken',
+          confidence: 'high',
+          note: 'Found in Google search results'
+        };
+      }
+
+      // If we have search results but no exact match, check if top result is Instagram
+      if (searchResults.length > 0) {
+        const topResult = searchResults[0].toLowerCase();
+        // If top result is NOT Instagram, account likely doesn't exist
+        if (!topResult.includes('instagram.com')) {
+          // Don't immediately say available - verify with direct probe
+        }
+      }
+    } catch (e) {
+      // Search failed, continue to direct probe
+    }
+
+    // STRATEGY 2: Direct probe with params check
     const response = await fetchWithHeaders(url, { timeout: 20000 });
 
     // 404 = account doesn't exist (RELIABLE)
@@ -163,11 +204,46 @@ async function checkInstagram(username) {
           return { exists: false, url, status: 'available', confidence: 'high', note: 'Page not found (verified)' };
         }
 
-        // Check for profile indicators in body
+        // USER DISCOVERED PATTERN: Check for username in params field
+        // EXISTS: "params": { "username": "vanillamale" }
+        // DOESN'T EXIST: "params": {} or "params": { } (empty)
+
+        // Look for params section with username
+        const paramsWithUsernameRegex = new RegExp(
+          `"params"\\s*:\\s*\\{[^}]*"username"\\s*:\\s*"${cleanUsername}"`,
+          'i'
+        );
+        const hasUsernameInParams = paramsWithUsernameRegex.test(html);
+
+        if (hasUsernameInParams) {
+          return {
+            exists: true,
+            url,
+            status: 'taken',
+            confidence: 'high',
+            note: 'Profile verified (username in params)'
+          };
+        }
+
+        // Check for empty params (account doesn't exist)
+        const emptyParamsRegex = /"params"\s*:\s*\{\s*\}/;
+        const hasEmptyParams = emptyParamsRegex.test(html);
+
+        if (hasEmptyParams) {
+          return {
+            exists: false,
+            url,
+            status: 'available',
+            confidence: 'high',
+            note: 'Empty params (no account)'
+          };
+        }
+
+        // Fallback: Check for other profile indicators
         if (html.includes('"username":"' + cleanUsername + '"') ||
             html.includes('profilePage') ||
             html.includes('ProfilePage')) {
-          return { exists: true, url, status: 'taken', confidence: 'high', note: 'Profile verified' };
+          return { exists: true, url, status: 'taken', confidence: 'medium', note: 'Profile indicators found' };
         }
 
         // Got 200 but can't verify - be conservative
