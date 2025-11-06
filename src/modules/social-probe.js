@@ -9,6 +9,76 @@ const cheerio = require('cheerio');
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 /**
+ * Search engines for Facebook verification via Google/Bing search
+ */
+async function searchEngine(query, maxResults = 10) {
+  try {
+    // Try Bing first (more reliable for scraping)
+    const urls = await bingSearch(query, maxResults);
+    if (urls.length > 0) return urls;
+
+    // Fallback to DuckDuckGo
+    return await ddgSearch(query, maxResults);
+  } catch (error) {
+    return [];
+  }
+}
+
+async function bingSearch(query, num = 10) {
+  try {
+    const qs = new URLSearchParams({ q: query, count: String(num) }).toString();
+    const url = `https://www.bing.com/search?${qs}`;
+    const html = await fetchPage(url);
+    if (!html) return [];
+
+    const $ = cheerio.load(html);
+    const urls = [];
+    $('li.b_algo, .b_algo, ol#b_results > li').each((i, el) => {
+      if (urls.length >= num) return false;
+      const a = $(el).find('h2 a').attr('href') || $(el).find('a[href^="http"]').attr('href');
+      if (a && a.startsWith('http')) urls.push(a);
+    });
+    return [...new Set(urls)].slice(0, num);
+  } catch {
+    return [];
+  }
+}
+
+async function ddgSearch(query, num = 10) {
+  try {
+    const qs = new URLSearchParams({ q: query, s: '0' }).toString();
+    const url = `https://duckduckgo.com/html/?${qs}`;
+    const html = await fetchPage(url);
+    if (!html) return [];
+
+    const $ = cheerio.load(html);
+    const urls = [];
+    $('a.result__a, a.result__url, div.result h2 a').each((i, el) => {
+      if (urls.length >= num) return false;
+      const href = $(el).attr('href');
+      if (href && href.startsWith('http')) urls.push(href);
+    });
+    return [...new Set(urls)].slice(0, num);
+  } catch {
+    return [];
+  }
+}
+
+async function fetchPage(url, timeout = 15000) {
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+      redirect: 'follow',
+      timeout
+    });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Fetch with proper headers and error handling
  * Uses GET method for better redirect compatibility
  */
@@ -66,14 +136,47 @@ async function fetchWithHeaders(url, options = {}) {
 
 /**
  * Check Instagram account
- * Instagram typically returns 200 for existing accounts, 404 for non-existent
- * May redirect to login page for existing accounts
+ * Strategy 1: Search-based detection (Primary - avoids anti-bot)
+ * Strategy 2: Direct probe (Fallback)
+ *
+ * SEARCH APPROACH:
+ * - Search "instagram {username}" on Bing/Google
+ * - If results contain instagram.com/{username}/ → account EXISTS
+ * - Avoids Instagram's aggressive anti-bot measures
  */
 async function checkInstagram(username) {
   const cleanUsername = username.replace(/^@/, '');
   const url = `https://www.instagram.com/${cleanUsername}/`;
 
   try {
+    // STRATEGY 1: Search-based detection
+    const searchQuery = `instagram ${cleanUsername}`;
+    const searchResults = await searchEngine(searchQuery, 10);
+
+    // Look for Instagram URLs matching this username
+    const igUrlPatterns = [
+      `instagram.com/${cleanUsername}`,
+      `instagram.com/${cleanUsername}/`,
+      `www.instagram.com/${cleanUsername}`,
+      `www.instagram.com/${cleanUsername}/`
+    ];
+
+    const foundInSearch = searchResults.some(resultUrl => {
+      const lowerUrl = resultUrl.toLowerCase();
+      return igUrlPatterns.some(pattern => lowerUrl.includes(pattern));
+    });
+
+    if (foundInSearch) {
+      return {
+        exists: true,
+        url,
+        status: 'taken',
+        confidence: 'high',
+        note: 'Found in search results (Google/Bing)'
+      };
+    }
+
+    // STRATEGY 2: Direct probe (fallback)
     const response = await fetchWithHeaders(url, { timeout: 20000 });
 
     // 404 = account doesn't exist
@@ -136,15 +239,56 @@ async function checkInstagram(username) {
 
 /**
  * Check Facebook page/profile
- * Facebook embeds user data in response body
- * EXISTS: Multiple "userID" fields (9+) with actual ID like "100051375944041"
- * NOT EXISTS: Only 1 "userID" field with value "0"
+ * Strategy 1: Search Google/Bing for "facebook {username}" to avoid anti-bot blocking
+ * Strategy 2: Direct probe with userID pattern detection (fallback)
+ *
+ * SEARCH APPROACH (Primary):
+ * - Search "facebook {username}" on Bing/Google
+ * - If results contain https://www.facebook.com/{username}/ → profile EXISTS
+ * - Avoids Facebook's anti-bot measures
+ *
+ * DIRECT PROBE (Fallback):
+ * - EXISTS: Multiple "userID" fields (9+) with actual ID like "100051375944041"
+ * - NOT EXISTS: Only 1 "userID" field with value "0"
  */
 async function checkFacebook(username) {
   const cleanUsername = username.replace(/^@/, '');
   const url = `https://www.facebook.com/${cleanUsername}`;
 
   try {
+    // STRATEGY 1: Search-based detection (Google/Bing search approach)
+    // Search for "facebook {username}" and check if Facebook URL appears in results
+    const searchQuery = `facebook ${cleanUsername}`;
+    const searchResults = await searchEngine(searchQuery, 10);
+
+    // Look for Facebook URLs matching this username
+    const fbUrlPatterns = [
+      `facebook.com/${cleanUsername}`,
+      `facebook.com/${cleanUsername}/`,
+      `www.facebook.com/${cleanUsername}`,
+      `www.facebook.com/${cleanUsername}/`,
+      `web.facebook.com/${cleanUsername}`,
+      `m.facebook.com/${cleanUsername}`
+    ];
+
+    const foundInSearch = searchResults.some(resultUrl => {
+      const lowerUrl = resultUrl.toLowerCase();
+      return fbUrlPatterns.some(pattern => lowerUrl.includes(pattern));
+    });
+
+    if (foundInSearch) {
+      return {
+        exists: true,
+        url,
+        status: 'taken',
+        confidence: 'high',
+        note: 'Found in search results (Google/Bing)'
+      };
+    }
+
+    // If search returns no results OR no Facebook URL found, try direct probe
+    // STRATEGY 2: Direct probe with userID pattern detection (fallback)
+
     const response = await fetchWithHeaders(url, { timeout: 20000 });
 
     // Get response body to check userID pattern
@@ -319,75 +463,112 @@ async function checkYouTube(username) {
 
 /**
  * Check Twitter/X account
- * Twitter redirects to x.com for existing accounts
- * Example: twitter.com/cretivox -> x.com/cretivox
+ * Strategy 1: Search-based detection (Primary)
+ * Strategy 2: Direct probe (Fallback)
+ *
+ * SEARCH APPROACH:
+ * - Search "twitter {username}" or "x {username}" on Bing/Google
+ * - If results contain twitter.com/{username} or x.com/{username} → account EXISTS
  */
 async function checkTwitter(username) {
   const cleanUsername = username.replace(/^@/, '');
 
-  // Try both twitter.com and x.com
-  const urls = [
-    `https://twitter.com/${cleanUsername}`,
-    `https://x.com/${cleanUsername}`
-  ];
+  try {
+    // STRATEGY 1: Search-based detection
+    const searchQuery = `twitter ${cleanUsername}`;
+    const searchResults = await searchEngine(searchQuery, 10);
 
-  for (const url of urls) {
-    try {
-      const response = await fetchWithHeaders(url, { timeout: 20000 });
+    // Look for Twitter/X URLs matching this username
+    const twitterUrlPatterns = [
+      `twitter.com/${cleanUsername}`,
+      `www.twitter.com/${cleanUsername}`,
+      `x.com/${cleanUsername}`,
+      `www.x.com/${cleanUsername}`
+    ];
 
-      // Successful page load = taken
-      if (response.status === 200) {
-        return { exists: true, url, status: 'taken', confidence: 'high' };
-      }
+    const foundInSearch = searchResults.some(resultUrl => {
+      const lowerUrl = resultUrl.toLowerCase();
+      return twitterUrlPatterns.some(pattern => lowerUrl.includes(pattern));
+    });
 
-      // 404 = doesn't exist
-      if (response.status === 404) {
-        // Only return available if BOTH URLs return 404
-        if (url === urls[urls.length - 1]) {
-          return { exists: false, url: urls[0], status: 'available', confidence: 'high' };
-        }
-        continue; // Try next URL
-      }
-
-      // Redirect = account exists
-      // Twitter redirects from twitter.com to x.com
-      if (response.isRedirect || response.status === 302 || response.status === 301) {
-        const redirUrl = response.redirectUrl || '';
-        // Check if redirect is to x.com or twitter.com domain (not error page)
-        if ((redirUrl.includes('x.com') || redirUrl.includes('twitter.com')) &&
-            !redirUrl.includes('login') && !redirUrl.includes('error')) {
-          return {
-            exists: true,
-            url: redirUrl || url,
-            status: 'taken',
-            confidence: 'high',
-            note: 'Redirected (account exists)'
-          };
-        }
-      }
-
-      // Network error
-      if (response.status === 0) {
-        continue; // Try next URL
-      }
-
-      // If we get here and it's not the last URL, try next
-      if (url !== urls[urls.length - 1]) {
-        continue;
-      }
-
-      // Last URL - return unknown
-      return { exists: null, url: urls[0], status: 'unknown', confidence: 'medium', note: `HTTP ${response.status}` };
-
-    } catch (error) {
-      if (url === urls[urls.length - 1]) {
-        return { exists: null, url: urls[0], status: 'unknown', confidence: 'none', error: error.message };
-      }
-      continue; // Try next URL
+    if (foundInSearch) {
+      return {
+        exists: true,
+        url: `https://twitter.com/${cleanUsername}`,
+        status: 'taken',
+        confidence: 'high',
+        note: 'Found in search results (Google/Bing)'
+      };
     }
-  }
 
-  return { exists: null, url: urls[0], status: 'unknown', confidence: 'none', note: 'All attempts failed' };
+    // STRATEGY 2: Direct probe (fallback)
+    // Try both twitter.com and x.com
+    const urls = [
+      `https://twitter.com/${cleanUsername}`,
+      `https://x.com/${cleanUsername}`
+    ];
+
+    for (const url of urls) {
+      try {
+        const response = await fetchWithHeaders(url, { timeout: 20000 });
+
+        // Successful page load = taken
+        if (response.status === 200) {
+          return { exists: true, url, status: 'taken', confidence: 'high' };
+        }
+
+        // 404 = doesn't exist
+        if (response.status === 404) {
+          // Only return available if BOTH URLs return 404
+          if (url === urls[urls.length - 1]) {
+            return { exists: false, url: urls[0], status: 'available', confidence: 'high' };
+          }
+          continue; // Try next URL
+        }
+
+        // Redirect = account exists
+        // Twitter redirects from twitter.com to x.com
+        if (response.isRedirect || response.status === 302 || response.status === 301) {
+          const redirUrl = response.redirectUrl || '';
+          // Check if redirect is to x.com or twitter.com domain (not error page)
+          if ((redirUrl.includes('x.com') || redirUrl.includes('twitter.com')) &&
+              !redirUrl.includes('login') && !redirUrl.includes('error')) {
+            return {
+              exists: true,
+              url: redirUrl || url,
+              status: 'taken',
+              confidence: 'high',
+              note: 'Redirected (account exists)'
+            };
+          }
+        }
+
+        // Network error
+        if (response.status === 0) {
+          continue; // Try next URL
+        }
+
+        // If we get here and it's not the last URL, try next
+        if (url !== urls[urls.length - 1]) {
+          continue;
+        }
+
+        // Last URL - return unknown
+        return { exists: null, url: urls[0], status: 'unknown', confidence: 'medium', note: `HTTP ${response.status}` };
+
+      } catch (error) {
+        if (url === urls[urls.length - 1]) {
+          return { exists: null, url: urls[0], status: 'unknown', confidence: 'none', error: error.message };
+        }
+        continue; // Try next URL
+      }
+    }
+
+    return { exists: null, url: urls[0], status: 'unknown', confidence: 'none', note: 'All attempts failed' };
+
+  } catch (error) {
+    return { exists: null, url: `https://twitter.com/${cleanUsername}`, status: 'unknown', confidence: 'none', error: error.message };
+  }
 }
 
 /**
